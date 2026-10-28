@@ -260,23 +260,31 @@ def process_unsorted(now):
         uid = it.get("uid")
         phone = norm_phone(str(meta.get("from") or ""))
         name = f"Пропущенный звонок {phone or (meta.get('from') or '')}"
-        if DRY_RUN:
-            log(f"  DRY_RUN: unsorted {str(uid)[:8]}… {name}")
-            handled += 1
-            continue
-        body = {"lead": {"name": name, "status_id": ST_NERAZOB}}
-        if phone:
-            body["contact"] = {"name": name, "custom_fields_values": [
-                {"field_id": PHONE_FIELD, "values": [{"value": phone}]}]}
-        acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", body)
-        new_id = acc.get("id") or ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
-        log(f"  лоток: принят пропущенный {meta.get('from')} -> сделка {new_id}")
-        if new_id:
-            process_missed({"id": new_id, "name": name, "status_id": ST_NERAZOB}, [], now)
-        handled += 1
+        try:
+            handled += accept_missed(uid, name, phone, meta, now)
+        except Exception as e:
+            log(f"  лоток: ошибка обработки {str(uid)[:8]}…: {e}")
     if handled:
         log(f"лоток Неразобранное: обработано пропущенных {handled}")
     return handled
+
+
+def accept_missed(uid, name, phone, meta, now):
+    """Принять один пропущенный из лотка в воронку и обработать по правилу пропущенных."""
+    if DRY_RUN:
+        log(f"  DRY_RUN: unsorted {str(uid)[:8]}… {name}")
+        return 1
+    # accept принимает массив элементов {lead, contact} — как POST /leads
+    item = {"lead": {"name": name, "status_id": ST_NERAZOB}}
+    if phone:
+        item["contact"] = {"name": name, "custom_fields_values": [
+            {"field_id": PHONE_FIELD, "values": [{"value": phone}]}]}
+    acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", [item])
+    new_id = acc.get("id") or ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+    log(f"  лоток: принят пропущенный {meta.get('from')} -> сделка {new_id}")
+    if new_id:
+        process_missed({"id": new_id, "name": name, "status_id": ST_NERAZOB}, [], now)
+    return 1
 
 
 # ---------------- разбор ----------------
