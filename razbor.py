@@ -259,9 +259,8 @@ def process_unsorted(now):
         meta = it.get("metadata") or {}
         uid = it.get("uid")
         phone = norm_phone(str(meta.get("from") or ""))
-        name = f"Пропущенный звонок {phone or (meta.get('from') or '')}"
         try:
-            handled += accept_missed(uid, name, phone, meta, now)
+            handled += accept_missed(uid, it.get("source_name") or "", phone, meta, now)
         except Exception as e:
             log(f"  лоток: ошибка обработки {str(uid)[:8]}…: {e}")
     if handled:
@@ -269,21 +268,25 @@ def process_unsorted(now):
     return handled
 
 
-def accept_missed(uid, name, phone, meta, now):
-    """Принять один пропущенный из лотка в воронку и обработать по правилу пропущенных."""
+def accept_missed(uid, src_name, phone, meta, now):
+    """Принять один пропущенный из лотка в воронку и обработать по правилу пропущенных.
+    accept принимает пустое тело: сделка создаётся с именем телефонии в «Первичный»."""
     if DRY_RUN:
-        log(f"  DRY_RUN: unsorted {str(uid)[:8]}… {name}")
+        log(f"  DRY_RUN: unsorted {str(uid)[:8]}… {src_name}")
         return 1
-    # accept принимает массив элементов {lead, contact} — как POST /leads
-    item = {"lead": {"name": name, "status_id": ST_NERAZOB}}
-    if phone:
-        item["contact"] = {"name": name, "custom_fields_values": [
-            {"field_id": PHONE_FIELD, "values": [{"value": phone}]}]}
-    acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", [item])
-    new_id = acc.get("id") or ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+    acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", {})
+    new_id = ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+    if not new_id:
+        raise RuntimeError("accept не вернул id сделки")
+    short = f"Пропущенный звонок {phone or (meta.get('from') or '')}"
     log(f"  лоток: принят пропущенный {meta.get('from')} -> сделка {new_id}")
-    if new_id:
-        process_missed({"id": new_id, "name": name, "status_id": ST_NERAZOB}, [], now)
+    # короткое имя — иначе телефон в тексте задачи склеится с номером АТС
+    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short}])
+    if phone:
+        amo("POST", "/api/v4/contacts", [{"name": short, "custom_fields_values": [
+            {"field_id": PHONE_FIELD, "values": [{"value": phone}]}],
+            "_embedded": {"leads": [{"id": new_id}]}}])
+    process_missed({"id": new_id, "name": short, "status_id": ST_FIRST}, [], now)
     return 1
 
 
