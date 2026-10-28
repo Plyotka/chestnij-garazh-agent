@@ -15,6 +15,16 @@ on:
         required: false
         default: "false"
         type: string
+      window_start:
+        description: "Начало рабочего окна, МСК (по умолчанию 8:30)"
+        required: false
+        default: "8:30"
+        type: string
+      window_end:
+        description: "Конец рабочего окна, МСК (по умолчанию 18:30)"
+        required: false
+        default: "18:30"
+        type: string
 
 # прогоны не должны пересекаться: следующий ждёт завершения предыдущего
 concurrency:
@@ -32,6 +42,8 @@ jobs:
       AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
       MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      WINDOW_START: ${{ github.event.inputs.window_start || '8:30' }}
+      WINDOW_END: ${{ github.event.inputs.window_end || '18:30' }}
       KIMI_MODEL: kimi-k2.6
       MAX_LEADS_PER_RUN: "30"
     steps:
