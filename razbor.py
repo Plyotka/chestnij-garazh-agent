@@ -140,7 +140,7 @@ def classify(transcript):
             {"role": "user", "content": "РАСШИФРОВКА ЗВОНКА:\n" + transcript[:12000]},
         ],
     }
-    resp = http("POST", f"{KIMI_BASE}/v1/chat/completions", token=KIMI_KEY, body=body, tries=3)
+    resp = http("POST", f"{KIMI_BASE}/v1/chat/completions", token=KIMI_KEY, body=body, tries=3, timeout=120)
     content = resp["choices"][0]["message"]["content"]
     return json.loads(content)
 
