@@ -236,6 +236,49 @@ def carry_overdue_tasks(now):
     return {"moved": len(moved), "closed": len(closed)}
 
 
+# ---------------- лоток «Неразобранное» (unsorted) ----------------
+
+def norm_phone(raw):
+    """11 цифр, начинается с 7/8 -> +7XXXXXXXXXX, иначе None."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits[0] in "78":
+        return "+7" + digits[1:]
+    return None
+
+
+def process_unsorted(now):
+    """Пропущенные из лотка «Неразобранное» (входящие телефонии): принять в воронку
+    и обработать по правилу пропущенных (Бадри + задача + маркер + телефон в контакт).
+    Прочие заявки лотка (чаты/формы) не трогаем — их разбирает менеджер вручную."""
+    items = embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
+    handled = 0
+    for it in items:
+        src = it.get("source_name") or ""
+        if "пропущен" not in src.lower():
+            continue
+        meta = it.get("metadata") or {}
+        uid = it.get("uid")
+        phone = norm_phone(str(meta.get("from") or ""))
+        name = f"Пропущенный звонок {phone or (meta.get('from') or '')}"
+        if DRY_RUN:
+            log(f"  DRY_RUN: unsorted {str(uid)[:8]}… {name}")
+            handled += 1
+            continue
+        body = {"lead": {"name": name, "status_id": ST_NERAZOB}}
+        if phone:
+            body["contact"] = {"name": name, "custom_fields_values": [
+                {"field_id": PHONE_FIELD, "values": [{"value": phone}]}]}
+        acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", body)
+        new_id = acc.get("id") or ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+        log(f"  лоток: принят пропущенный {meta.get('from')} -> сделка {new_id}")
+        if new_id:
+            process_missed({"id": new_id, "name": name, "status_id": ST_NERAZOB}, [], now)
+        handled += 1
+    if handled:
+        log(f"лоток Неразобранное: обработано пропущенных {handled}")
+    return handled
+
+
 # ---------------- разбор ----------------
 
 def extract_phone(text):
@@ -409,6 +452,9 @@ def run():
     # ШАГ 0: перенос просроченных задач (правило 28.10)
     overdue = carry_overdue_tasks(now)
 
+    # лоток «Неразобранное»: пропущенные из телефонии принимаем в воронку
+    unsorted_handled = process_unsorted(now)
+
     from_ts = int((now - timedelta(days=3)).timestamp())
     leads, url = [], f"{AMO_BASE}/api/v4/leads?limit=100&order[updated_at]=desc&filter[updated_at][from]={from_ts}"
     while url:
@@ -477,6 +523,7 @@ def run():
         "run": now.strftime("%d.%m.%Y %H:%M"),
         "dry_run": DRY_RUN,
         "overdue": overdue,
+        "unsorted_missed": unsorted_handled,
         "processed": len(processed),
         "skipped": len(skipped),
         "errors": len(errors),
