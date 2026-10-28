@@ -1,0 +1,40 @@
+name: chg-razbor
+
+on:
+  schedule:
+    # 08:27, 08:57 МСК (UTC+3)
+    - cron: "27,57 5 * * *"
+    # 09:00–17:30 МСК каждые 30 минут
+    - cron: "*/30 6-14 * * *"
+    # 18:27 МСК
+    - cron: "27 15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "DRY_RUN (true — без записи в amo, полный прогон на чтение)"
+        required: false
+        default: "false"
+        type: string
+
+# прогоны не должны пересекаться: следующий ждёт завершения предыдущего
+concurrency:
+  group: chg-razbor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  razbor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      KIMI_MODEL: kimi-k2.6
+      MAX_LEADS_PER_RUN: "30"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Разбор звонков (ШАГ 0 + пропущенные + расшифровки Войси)
+        run: python3 razbor.py
