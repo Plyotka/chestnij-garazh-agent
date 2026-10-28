@@ -1,6 +1,8 @@
-# chg-razbor
+# chestnij-garazh-agent
 
 Разбор звонков автосервиса «Честный Гараж» (amoCRM + расшифровки Войси + Kimi).
+
+Репозиторий: https://github.com/Plyotka/chestnij-garazh-agent (бывший `chg-razbor`, переименован 28.10.2026).
 
 Запускается GitHub Actions по расписанию в рабочем окне 08:30–18:30 МСК
 (сетка :27/:57 — компенсация возможных задержек GitHub cron).
