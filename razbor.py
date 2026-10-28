@@ -384,7 +384,11 @@ def apply_result(lead, r, now, phone_guess=None):
     elif cat == 5:
         patch["status_id"] = ST_CLOSED
         patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
-    # cat == 4 — patch только с именем? Нет: «не трогаем» — вообще ничего.
+    elif cat == 4:
+        # Категория 4 вне «приехал» → поднять сделку в «приехал» (повышение разрешено;
+        # правило 28.10, уточнение владельца). Задачу не ставим, ответственного не меняем.
+        if cur_status != ST_PRIEHAL:
+            patch["status_id"] = ST_PRIEHAL
 
     if DRY_RUN:
         log(f"  DRY_RUN: категория {cat}, patch={patch}, задача={task_text!r}")
@@ -396,6 +400,9 @@ def apply_result(lead, r, now, phone_guess=None):
         amo("PATCH", "/api/v4/leads", [patch])
         # контакты сделки → то же короткое имя + телефон, если в контакте его нет
         sync_contacts(lid, lead_name, phone_guess)
+    elif patch.get("status_id") == ST_PRIEHAL:
+        # категория 4 вне «приехал»: только поднять этап, остальное не трогаем
+        amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_PRIEHAL}])
 
     # заметка-разбор (всегда, включая категорию 4)
     amo("POST", f"/api/v4/leads/{lid}/notes", [
