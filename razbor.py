@@ -247,25 +247,47 @@ def norm_phone(raw):
 
 
 def process_unsorted(now):
-    """Пропущенные из лотка «Неразобранное» (входящие телефонии): принять в воронку
-    и обработать по правилу пропущенных (Бадри + задача + маркер + телефон в контакт).
+    """Лоток «Неразобранное» (входящие интеграций): пропущенные звонки телефонии и
+    диалоги MAX принимаем в воронку с маршрутизацией (Бадри + задача + маркер).
     Прочие заявки лотка (чаты/формы) не трогаем — их разбирает менеджер вручную."""
     items = embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
     handled = 0
     for it in items:
         src = it.get("source_name") or ""
-        if "пропущен" not in src.lower():
-            continue
         meta = it.get("metadata") or {}
         uid = it.get("uid")
-        phone = norm_phone(str(meta.get("from") or ""))
         try:
-            handled += accept_missed(uid, it.get("source_name") or "", phone, meta, now)
+            if "пропущен" in src.lower():
+                phone = norm_phone(str(meta.get("from") or ""))
+                handled += accept_missed(uid, src, phone, meta, now)
+            elif "integration.max" in src.lower() or meta.get("service") == "integration.max":
+                handled += accept_max(uid, meta, now)
         except Exception as e:
             log(f"  лоток: ошибка обработки {str(uid)[:8]}…: {e}")
     if handled:
-        log(f"лоток Неразобранное: обработано пропущенных {handled}")
+        log(f"лоток Неразобранное: обработано {handled}")
     return handled
+
+
+def accept_max(uid, meta, now):
+    """Диалог MAX из лотка (интеграция amojo): принять в воронку, Бадри, задача, маркер.
+    Телефона в метаданных MAX обычно нет — контакт без номера."""
+    if DRY_RUN:
+        log(f"  DRY_RUN: unsorted MAX {str(uid)[:8]}… {(meta.get('client') or {}).get('name')}")
+        return 1
+    acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", {})
+    new_id = ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+    if not new_id:
+        raise RuntimeError("accept не вернул id сделки")
+    client = ((meta.get("client") or {}).get("name") or meta.get("from") or "").strip()
+    short = f"MAX — {client}" if client else "MAX — обращение"
+    log(f"  лоток: принят диалог MAX ({client or 'без имени'}) -> сделка {new_id}")
+    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short, "responsible_user_id": BADRI}])
+    amo("POST", f"/api/v4/leads/{new_id}/notes", [{"note_type": "common", "params": {
+        "text": f"MAX-обращение принято: {now.strftime('%d.%m.%Y')}"}}])
+    upsert_task(new_id, f"Kimi для Бадри: Актуализировать обращение из MAX — {client or 'клиент'}",
+                BADRI, today_18_msk())
+    return 1
 
 
 def accept_missed(uid, src_name, phone, meta, now):
