@@ -118,8 +118,10 @@ CLASSIFY_SYSTEM = """Ты — оператор сделок автосервис
 5 — ОТКАЗ: сервис отказал (не делаем такие работы / такое авто / нет запчастей и клиент уходит).
 
 ПРАВИЛА:
+- ПРАВИЛА:
 - Сомнение между категориями → выбирай меньшую (1 или 2).
-- Имя сделки lead_name: «<Марка Модель> — <суть не более 6 слов>», например «Renault Duster — замена глушителя». Марка неизвестна → «Авто — <суть>».
+- Если расшифровок несколько — это НЕСКОЛЬКО звонков по одной сделке: учитывай ВСЕ вместе. Более поздний короткий или пустой звонок НЕ отменяет информацию более раннего содержательного: имя, категорию, этап и задачу определяй по совокупности, при конфликте — по более содержательному звонку.
+- Имя сделки lead_name: «<Марка Модель> — <суть не более 6 слов>», например «Renault Duster — замена глушителя». Марка неизвестна → «Авто — <суть>». ВАЖНО: если в запросе передано ТЕКУЩЕЕ ИМЯ СДЕЛКИ и оно уже содержательное (не «Входящий звонок…», не «Пропущенный…», не «MAX — …», не пустое) — верни его БЕЗ ИЗМЕНЕНИЙ, даже если расшифровка новая. Новое имя придумывай только если текущее пустое/системное, либо если звонок полностью меняет суть обращения.
 - arrival: только для категории 3 — unixtime времени приезда по Europe/Moscow, если сказано в звонке, иначе null.
 - quality: оценка работы сотрудника с телефоном — начинается со слова «хорошо» / «средне» / «слабо», далее тире и одна фраза.
 - close_reason: только для категории 5 — краткая причина отказа, иначе null.
@@ -129,7 +131,10 @@ CLASSIFY_SYSTEM = """Ты — оператор сделок автосервис
 {"category": 1, "lead_name": "...", "car": "...", "request": "...", "outcome": "одна фраза итога", "quality": "средне — одна фраза", "action": "одна строка действия", "arrival": null, "close_reason": null}"""
 
 
-def classify(transcript):
+def classify(transcript, current_name=""):
+    user = "РАСШИФРОВКИ ЗВОНКОВ ПО СДЕЛКЕ (по времени):\n" + transcript[:20000]
+    if current_name:
+        user += f"\n\nТЕКУЩЕЕ ИМЯ СДЕЛКИ: «{current_name}»"
     body = {
         "model": KIMI_MODEL,
         # kimi-k2.6 (reasoning) принимает только temperature=1
@@ -137,7 +142,7 @@ def classify(transcript):
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": CLASSIFY_SYSTEM},
-            {"role": "user", "content": "РАСШИФРОВКА ЗВОНКА:\n" + transcript[:12000]},
+            {"role": "user", "content": user},
         ],
     }
     resp = http("POST", f"{KIMI_BASE}/v1/chat/completions", token=KIMI_KEY, body=body, tries=3, timeout=120)
@@ -566,8 +571,13 @@ def run():
                 skipped.append({"lead_id": lid, "reason": "нет расшифровки Войси"})
                 continue
 
-            latest = max(fresh, key=lambda n: n.get("created_at", 0))
-            transcript = note_text(latest)
+            fresh_sorted = sorted(fresh, key=lambda n: n.get("created_at", 0))
+            parts = []
+            for i, n in enumerate(fresh_sorted, 1):
+                txt = note_text(n)
+                if txt:
+                    parts.append(f"=== ЗВОНОК {i} ===\n{txt}")
+            transcript = "\n\n".join(parts)
             if len(transcript) < 30:
                 log(f"  сделка {lid}: расшифровка слишком короткая — пропуск")
                 skipped.append({"lead_id": lid, "reason": "короткая расшифровка"})
@@ -579,7 +589,7 @@ def run():
                      "outcome": "DRY_RUN без LLM", "quality": None, "action": None,
                      "arrival": None, "close_reason": None}
             else:
-                r = classify(transcript)
+                r = classify(transcript, lead.get("name") or "")
             phone_guess = extract_phone(transcript) or extract_phone(lead.get("name") or "")
             processed.append(apply_result(lead, r, now, phone_guess))
         except Exception as e:
