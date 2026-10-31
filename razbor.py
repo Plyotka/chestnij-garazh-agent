@@ -246,6 +246,20 @@ def norm_phone(raw):
     return None
 
 
+def find_open_lead_by_phone(phone):
+    """Открытая сделка с таким номером (для дедупликации пропущенных)."""
+    if not phone:
+        return None
+    digits = re.sub(r"\D", "", phone)
+    resp = amo_get(f"/api/v4/leads?query={digits}&limit=20")
+    for l in embedded(resp, "leads"):
+        if l.get("status_id") in (ST_SUCCESS, ST_CLOSED):
+            continue
+        if digits in re.sub(r"\D", "", l.get("name") or ""):
+            return l["id"]
+    return None
+
+
 def process_unsorted(now):
     """Лоток «Неразобранное» (входящие интеграций): пропущенные звонки телефонии и
     диалоги MAX принимаем в воронку с маршрутизацией (Бадри + задача + маркер).
@@ -259,6 +273,12 @@ def process_unsorted(now):
         try:
             if "пропущен" in src.lower():
                 phone = norm_phone(str(meta.get("from") or ""))
+                dup = find_open_lead_by_phone(phone)
+                if dup:
+                    # повторный звонок с того же номера — не плодим дубль,
+                    # заявка остаётся в лотке для ручного слияния менеджером
+                    log(f"  лоток: пропущенный {phone} — уже есть открытая сделка {dup}, дубль не создан")
+                    continue
                 handled += accept_missed(uid, src, phone, meta, now)
             elif "integration.max" in src.lower() or meta.get("service") == "integration.max":
                 handled += accept_max(uid, meta, now)
@@ -535,7 +555,14 @@ def run():
             last_call = max((n.get("created_at", 0) for n in calls), default=0)
             last_trans = max((n.get("created_at", 0) for n in trans), default=0)
             if last_call > last_trans and last_call > last_razbor:
+                wait_h = (now.timestamp() - last_call) / 3600.0
                 log(f"  сделка {lid}: свежий звонок без расшифровки — переносим")
+                # ждём Войси 6 часов, дальше — флаг менеджеру (один раз)
+                if wait_h > 6 and not any("Расшифровка Войси не появилась" in t for _, t in texts):
+                    amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                        "text": f"Расшифровка Войси не появилась за {int(wait_h)} ч после звонка. "
+                                f"Проверьте запись вручную: разбор автоматикой невозможен без текста."}}])
+                    log(f"  сделка {lid}: флаг менеджеру — расшифровки нет {int(wait_h)} ч")
                 skipped.append({"lead_id": lid, "reason": "нет расшифровки Войси"})
                 continue
 
