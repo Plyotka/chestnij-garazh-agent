@@ -251,6 +251,47 @@ def norm_phone(raw):
     return None
 
 
+def repair_phones(leads):
+    """Сделки с номером в имени, но без телефона в контакте, — дозаписать номер.
+    Иначе дубли по номеру не видны: имя может переименоваться, а контакт остаться пустым."""
+    fixed = 0
+    for l in leads:
+        if l.get("status_id") in (ST_SUCCESS, ST_CLOSED):
+            continue
+        phone = extract_phone(l.get("name") or "")
+        if not phone:
+            continue
+        full = amo_get(f"/api/v4/leads/{l['id']}?with=contacts")
+        contacts = embedded(full, "contacts")
+        if not contacts:
+            # контакта нет вовсе — создаём с номером, привязанным к сделке
+            amo("POST", "/api/v4/contacts", [{
+                "name": l.get("name") or f"Клиент {phone}",
+                "custom_fields_values": [{"field_id": PHONE_FIELD, "values": [{"value": phone}]}],
+                "_embedded": {"leads": [{"id": l['id']}]}}])
+            fixed += 1
+            log(f"  контакт с номером создан: сделка {l['id']} ({phone})")
+            continue
+        payload = []
+        for c in contacts:
+            try:
+                detail = amo_get(f"/api/v4/contacts/{c['id']}")
+                values = detail.get("custom_fields_values") or []
+                has_phone = any(v.get("field_id") == PHONE_FIELD and v.get("values") for v in values)
+            except Exception:
+                has_phone = True  # не смогли проверить — не трогаем
+            if not has_phone:
+                payload.append({"id": c["id"], "custom_fields_values": [
+                    {"field_id": PHONE_FIELD, "values": [{"value": phone}]}]})
+        if payload:
+            amo("PATCH", "/api/v4/contacts", payload)
+            fixed += len(payload)
+            log(f"  телефон из имени дозаписан в контакт: сделка {l['id']} ({phone})")
+    if fixed:
+        log(f"ремонт телефонов: дозаписано {fixed} контактам")
+    return fixed
+
+
 def find_open_lead_by_phone(phone):
     """Открытая сделка с таким номером (для дедупликации пропущенных)."""
     if not phone:
@@ -340,10 +381,14 @@ def accept_missed(uid, src_name, phone, meta, now):
 # ---------------- разбор ----------------
 
 def extract_phone(text):
-    """Найти российский номер в тексте (расшифровка/имя) и привести к +7XXXXXXXXXX."""
+    """Найти российский номер в тексте (расшифровка/имя) и привести к +7XXXXXXXXXX.
+    Имена телефонии часто «Входящий 79001234567» без плюса — ловим и такие."""
     m = PHONE_RE.search(text or "")
     if not m:
-        return None
+        m = re.search(r"(?<!\d)(7\d{10})(?!\d)", text or "")
+        if not m:
+            return None
+        return "+7" + m.group(1)[1:]
     digits = re.sub(r"\D", "", m.group(0))
     if len(digits) == 11 and digits[0] in "78":
         return "+7" + digits[1:]
@@ -529,6 +574,9 @@ def run():
         url = nxt.get("href")
     log(f"сделок за 3 дня: {len(leads)}")
 
+    # ремонт: номер есть в имени сделки, но не в контакте — дозаписать (видимость дублей)
+    repaired_phones = repair_phones(leads)
+
     processed, skipped, errors = [], [], []
     for lead in leads:
         if len(processed) >= MAX_LEADS_PER_RUN:
@@ -601,6 +649,7 @@ def run():
         "dry_run": DRY_RUN,
         "overdue": overdue,
         "unsorted_missed": unsorted_handled,
+        "phones_repaired": repaired_phones,
         "processed": len(processed),
         "skipped": len(skipped),
         "errors": len(errors),
