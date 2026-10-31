@@ -264,13 +264,17 @@ def repair_phones(leads):
         full = amo_get(f"/api/v4/leads/{l['id']}?with=contacts")
         contacts = embedded(full, "contacts")
         if not contacts:
-            # контакта нет вовсе — создаём с номером, привязанным к сделке
-            amo("POST", "/api/v4/contacts", [{
+            # контакта нет вовсе — создаём и привязываем к сделке через /link
+            # (_embedded при создании контакта сделку НЕ привязывает — проверено эмпирикой)
+            created = amo("POST", "/api/v4/contacts", [{
                 "name": l.get("name") or f"Клиент {phone}",
-                "custom_fields_values": [{"field_id": PHONE_FIELD, "values": [{"value": phone}]}],
-                "_embedded": {"leads": [{"id": l['id']}]}}])
+                "custom_fields_values": [{"field_id": PHONE_FIELD, "values": [{"value": phone}]}]}])
+            new_cid = ((created.get("_embedded") or {}).get("contacts") or [{}])[0].get("id")
+            if new_cid:
+                amo("POST", f"/api/v4/leads/{l['id']}/link",
+                    [{"to_entity_id": new_cid, "to_entity_type": "contacts"}])
             fixed += 1
-            log(f"  контакт с номером создан: сделка {l['id']} ({phone})")
+            log(f"  контакт с номером создан и привязан: сделка {l['id']} ({phone})")
             continue
         payload = []
         for c in contacts:
