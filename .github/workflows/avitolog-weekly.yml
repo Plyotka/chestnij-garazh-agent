@@ -1,0 +1,29 @@
+name: chg-avitolog-weekly
+
+on:
+  schedule:
+    # понедельник 10:00 МСК (UTC+3)
+    - cron: "7 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: chg-avitolog-weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
+      AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
+      AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
+      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      KIMI_MODEL: kimi-k2.6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Авито-еженедельник (сбор кодом + LLM-анализ, правки на подтверждение)
+        run: python3 avitolog/weekly.py | tee avitolog/weekly.out
