@@ -270,6 +270,9 @@ def run():
                 if "avito" in (u.get("source_name") or "").lower()]
     log(f"чат-заявок в «Неразобранном»: {len(unsorted)} (беру до {MAX_PER_RUN})")
 
+    # FIFO: берём САМЫЕ СТАРЫЕ заявки первыми — иначе хвост (старые чаты)
+    # голодал: свежие падали сверху списка и съедали лимит каждый прогон.
+    unsorted.sort(key=lambda u: u.get("created_at") or 0)
     acted, skipped, errors = [], [], []
     for item in unsorted[:MAX_PER_RUN]:
         uid = item.get("uid")
