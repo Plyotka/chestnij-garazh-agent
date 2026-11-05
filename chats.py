@@ -273,6 +273,19 @@ def run():
     # FIFO: берём САМЫЕ СТАРЫЕ заявки первыми — иначе хвост (старые чаты)
     # голодал: свежие падали сверху списка и съедали лимит каждый прогон.
     unsorted.sort(key=lambda u: u.get("created_at") or 0)
+
+    # антидубль внутри прогона: один клиент = один avito user id.
+    # Клиент может написать с НЕСКОЛЬКИХ объявлений — придёт несколько заявок
+    # в лоток; без этой проверки контур создаст по сделке на каждое объявление
+    # (кейс Юлианны 05.11: две сделки «Шиномонтаж» с разницей в минуту).
+    def chat_uid(c):
+        try:
+            return c["users"][0].get("id") or None
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    seen_uid = {}  # avito user id -> id созданной сделки
+
     acted, skipped, errors = [], [], []
     for item in unsorted[:MAX_PER_RUN]:
         uid = item.get("uid")
@@ -289,6 +302,26 @@ def run():
             if not outs:
                 skipped.append({"uid": uid, "reason": "Бадри ещё не отвечал — агент молчит"})
                 log(f"  {cname}: Бадри ещё не отвечал — пропуск")
+                continue
+
+            # антидубль: тот же клиент (avito user id) уже обработан в этом прогоне
+            au = chat_uid(chat)
+            if au and au in seen_uid:
+                if DRY_RUN:
+                    log(f"  DRY_RUN {cname}: дубль клиента (уже сделка {seen_uid[au]})")
+                    skipped.append({"uid": uid, "reason": f"дубль клиента, сделка {seen_uid[au]}"})
+                    continue
+                acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept",
+                          {"user_id": BADRI, "status_id": ST_FIRST})
+                dup_id = ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+                if dup_id:
+                    amo("PATCH", "/api/v4/leads", [{"id": dup_id, "status_id": ST_CLOSED,
+                                                    "loss_reason_id": 24765102}])  # Дубль
+                    amo("POST", f"/api/v4/leads/{dup_id}/notes", [{"note_type": "common", "params": {
+                        "text": f"Дубль: клиент {cname} писал с нескольких объявлений. "
+                                f"Основная сделка: {seen_uid[au]}. Закрыто автоматически чат-контуром."}}])
+                log(f"  {cname}: дубль клиента — принят и закрыт (основная сделка {seen_uid[au]})")
+                acted.append({"lead": dup_id, "client": cname, "interest": None, "dup_of": seen_uid[au]})
                 continue
 
             parts = []
@@ -389,6 +422,8 @@ def run():
 
             acted.append({"lead": new_id, "client": cname, "interest": interest,
                           "sent": bool(sent), "no_send": bool(NO_SEND and interest and not phone and tpl)})
+            if au:
+                seen_uid[au] = new_id
             log(f"  {cname}: сделка {new_id}, interest={interest}" + (", написали клиенту" if sent else ""))
         except Exception as e:
             errors.append({"uid": uid, "error": str(e)[:250]})
