@@ -313,7 +313,8 @@ def find_open_lead_by_phone(phone):
 def process_unsorted(now):
     """Лоток «Неразобранное» (входящие интеграций): пропущенные звонки телефонии и
     диалоги MAX принимаем в воронку с маршрутизацией (Бадри + задача + маркер).
-    Прочие заявки лотка (чаты/формы) не трогаем — их разбирает менеджер вручную."""
+    Чаты Авито тут не принимаем — их разбирает chats.py после ответа Бадри.
+    Прочие заявки лотка (формы) не трогаем — их разбирает менеджер вручную."""
     items = embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
     handled = 0
     for it in items:
@@ -325,9 +326,16 @@ def process_unsorted(now):
                 phone = norm_phone(str(meta.get("from") or ""))
                 dup = find_open_lead_by_phone(phone)
                 if dup:
-                    # повторный звонок с того же номера — не плодим дубль,
-                    # заявка остаётся в лотке для ручного слияния менеджером
-                    log(f"  лоток: пропущенный {phone} — уже есть открытая сделка {dup}, дубль не создан")
+                    # повторный звонок с того же номера — дубль не плодим;
+                    # вместо этого вешаем задачу перезвона на открытую сделку.
+                    # Заявку в лотке API отклонить не даёт (405) — остаётся для ручной чистки.
+                    if not DRY_RUN:
+                        amo("POST", f"/api/v4/leads/{dup}/notes", [{"note_type": "common", "params": {
+                            "text": f"Повторный пропущенный звонок {phone} ({now.strftime('%d.%m.%Y %H:%M')}) — дубль не создан"}}])
+                        upsert_task(dup, f"Kimi для Бадри: Перезвонить/актуализировать по пропущенному: {phone}",
+                                    BADRI, today_18_msk())
+                    log(f"  лоток: пропущенный {phone} — открытая сделка {dup}, дубль не создан, задача перезвона добавлена")
+                    handled += 1
                     continue
                 handled += accept_missed(uid, src, phone, meta, now)
             elif "integration.max" in src.lower() or meta.get("service") == "integration.max":
