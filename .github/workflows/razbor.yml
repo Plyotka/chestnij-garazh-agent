@@ -57,6 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Разбор звонков (ШАГ 0 + пропущенные + расшифровки Войси)
-        run: python3 razbor.py
+        run: python3 razbor.py | tee razbor.out
       - name: "Чат-контур Авито (после диалога Бадри — интерес → CRM + шаблон клиенту)"
-        run: python3 chats.py
+        run: python3 chats.py | tee chats.out
+      - name: Отчёт прогона в журнал CRM
+        if: always()
+        env:
+          JOURNAL_LEAD_ID: "37575635"
+        run: python3 journal.py
