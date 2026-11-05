@@ -461,6 +461,25 @@ def sync_contacts(lid, lead_name, phone_guess):
         amo("PATCH", "/api/v4/contacts", payload)
 
 
+def contact_phone(lid):
+    """Телефон из контакта сделки — для текста задачи, когда из расшифровки/имени
+    номер не вытащился (просьба владельца 06.11: у Бадри из списка задач
+    звонить сразу, не заходя в сделку)."""
+    try:
+        contacts = embedded(amo_get(f"/api/v4/leads/{lid}?with=contacts"), "contacts")
+        for c in contacts:
+            detail = amo_get(f"/api/v4/contacts/{c['id']}")
+            for v in detail.get("custom_fields_values") or []:
+                if v.get("field_id") == PHONE_FIELD:
+                    for val in v.get("values") or []:
+                        p = (val.get("value") or "").strip()
+                        if p:
+                            return p
+    except Exception:
+        pass
+    return None
+
+
 def build_note(r, now):
     lines = [
         f"Разбор звонка: {now.strftime('%d.%m.%Y %H:%M')}",
@@ -490,6 +509,8 @@ def apply_result(lead, r, now, phone_guess=None):
     # «Машина (телефон): суть». Телефон — вытащенный из расшифровки/имени.
     car_part = (r.get("car") or "").strip() or lead_name.split("—")[0].strip() or "авто"
     req_part = (r.get("request") or "").strip()
+    if not phone_guess:
+        phone_guess = contact_phone(lid)
     info = car_part + (f" ({phone_guess})" if phone_guess else "")
     if req_part:
         info += f": {req_part}"
