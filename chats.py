@@ -59,6 +59,7 @@ ST_TEPLY = 88470418   # Тёплые
 ST_PRIEDET = 88470422 # приедет
 ST_CLOSED = 143       # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
+TAG_CHAT = "Чат"  # тег сделок чат-контура Авито
 PHONE_FIELD = 1133163
 
 # утверждённые шаблоны исходящих (только они, ничего от LLM клиенту)
@@ -363,7 +364,8 @@ def run():
                 f"Итог: {'интерес' if interest else 'нет интереса'} — {r.get('summary') or ''}",
             ])
 
-            patch = {"id": new_id, "name": lead_name}
+            patch = {"id": new_id, "name": lead_name,
+                     "_embedded": {"tags": [{"name": TAG_CHAT}]}}
             tasks = []
             if not interest:
                 patch["status_id"] = ST_CLOSED

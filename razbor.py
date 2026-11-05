@@ -48,6 +48,7 @@ PHONE_FIELD = 1133163      # поле «Телефон» в контактах (
 PHONE_RE = re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
 ST_CLOSED = 143            # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
+TAG_CALL = "Звонок"  # тег сделок звонкового контура
 
 STAGE_RANK = {ST_NERAZOB: 0, ST_FIRST: 1, ST_TEPLY: 2, ST_PRIEDET: 3, ST_PRIEHAL: 4}
 
@@ -367,7 +368,8 @@ def accept_max(uid, meta, now):
     client = ((meta.get("client") or {}).get("name") or meta.get("from") or "").strip()
     short = f"MAX — {client}" if client else "MAX — обращение"
     log(f"  лоток: принят диалог MAX ({client or 'без имени'}) -> сделка {new_id}")
-    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short, "responsible_user_id": BADRI}])
+    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short, "responsible_user_id": BADRI,
+        "_embedded": {"tags": [{"name": TAG_CALL}]}}])
     amo("POST", f"/api/v4/leads/{new_id}/notes", [{"note_type": "common", "params": {
         "text": f"MAX-обращение принято: {now.strftime('%d.%m.%Y')}"}}])
     upsert_task(new_id, f"Kimi для Бадри: Актуализировать обращение из MAX — {client or 'клиент'}",
@@ -388,7 +390,8 @@ def accept_missed(uid, src_name, phone, meta, now):
     short = f"Пропущенный звонок {phone or (meta.get('from') or '')}"
     log(f"  лоток: принят пропущенный {meta.get('from')} -> сделка {new_id}")
     # короткое имя — иначе телефон в тексте задачи склеится с номером АТС
-    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short}])
+    amo("PATCH", "/api/v4/leads", [{"id": new_id, "name": short,
+        "_embedded": {"tags": [{"name": TAG_CALL}]}}])
     if phone:
         amo("POST", "/api/v4/contacts", [{"name": short, "custom_fields_values": [
             {"field_id": PHONE_FIELD, "values": [{"value": phone}]}],
@@ -462,6 +465,14 @@ def apply_result(lead, r, now, phone_guess=None):
     patch = {"id": lid, "name": lead_name}
     task_text = task_due = resp_id = None
 
+    # контекст для задачи в стиле «старого» формата (похвалил владелец):
+    # «Машина (телефон): суть». Телефон — вытащенный из расшифровки/имени.
+    car_part = (r.get("car") or "").strip() or lead_name.split("—")[0].strip() or "авто"
+    req_part = (r.get("request") or "").strip()
+    info = car_part + (f" ({phone_guess})" if phone_guess else "")
+    if req_part:
+        info += f": {req_part}"
+
     if cur_status == ST_PRIEHAL:
         # Жёсткое правило: «приехал» — сделку вообще не трогаем, только заметка.
         cat = 4
@@ -473,7 +484,7 @@ def apply_result(lead, r, now, phone_guess=None):
         resp_id = BADRI
         if cur_status == ST_NERAZOB:
             patch["status_id"] = ST_FIRST
-        task_text = "Kimi для Бадри: Перезвонить/актуализировать"
+        task_text = f"Kimi для Бадри: Перезвонить/актуализировать. {info}"
         task_due = today_18_msk()
     elif cat == 2:
         # Решение владельца 06.11: контур ЗВОНКОВ целиком на Бадри (он звонит).
@@ -481,13 +492,13 @@ def apply_result(lead, r, now, phone_guess=None):
         resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_TEPLY]:
             patch["status_id"] = ST_TEPLY
-        task_text = "Kimi для Бадри: Когда приедет?"
+        task_text = f"Kimi для Бадри: Когда приедет? {info}"
         task_due = tomorrow_10_msk()
     elif cat == 3:
         resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_PRIEDET]:
             patch["status_id"] = ST_PRIEDET
-        task_text = "Kimi для Бадри: Приехал?"
+        task_text = f"Kimi для Бадри: Приехал? {info}"
         arr = r.get("arrival")
         now_ts = int(now.timestamp())
         if isinstance(arr, (int, float)) and now_ts - 3600 <= arr <= now_ts + 30 * 86400:
@@ -510,6 +521,7 @@ def apply_result(lead, r, now, phone_guess=None):
     if cat != 4:
         if cat in (1, 2, 3):
             patch["responsible_user_id"] = resp_id
+        patch["_embedded"] = {"tags": [{"name": TAG_CALL}]}
         amo("PATCH", "/api/v4/leads", [patch])
         # контакты сделки → то же короткое имя + телефон, если в контакте его нет
         sync_contacts(lid, lead_name, phone_guess)
@@ -543,7 +555,8 @@ def process_missed(lead, notes, now):
     if DRY_RUN:
         log(f"  DRY_RUN: пропущенный {lid}, задача={task_text!r}")
         return {"lead_id": lid, "category": "missed", "dry": True}
-    patch = {"id": lid, "responsible_user_id": BADRI}
+    patch = {"id": lid, "responsible_user_id": BADRI,
+             "_embedded": {"tags": [{"name": TAG_CALL}]}}
     if lead.get("status_id") == ST_NERAZOB:
         patch["status_id"] = ST_FIRST
     amo("PATCH", "/api/v4/leads", [patch])
