@@ -81,35 +81,35 @@ def main():
     parts = [f"Прогон {now.strftime('%d.%m.%Y %H:%M')} мск"]
 
     if rz is None:
-        parts.append("📞 Звонки: прогон не отработал (см. лог GitHub)")
+        parts.append("[ЗВОНКИ] прогон не отработал (см. лог GitHub)")
     else:
         ov = rz.get("overdue") or {}
         if ov:
-            parts.append(f"  ⏰ просроченные задачи: перенесено {ov.get('moved', 0)}, закрыто {ov.get('closed', 0)}")
+            parts.append(f"  [!] просроченные задачи: перенесено {ov.get('moved', 0)}, закрыто {ov.get('closed', 0)}")
         if rz.get("unsorted_missed"):
-            parts.append(f"  📥 обработано пропущенных из лотка: {rz['unsorted_missed']}")
-        head = f"📞 Звонки: разобрано {rz['processed']}, отложено {rz['skipped']}, ошибок {rz['errors']}"
+            parts.append(f"  [лоток] обработано пропущенных из лотка: {rz['unsorted_missed']}")
+        head = f"[ЗВОНКИ] разобрано {rz['processed']}, отложено {rz['skipped']}, ошибок {rz['errors']}"
         parts.append(head)
         parts += bullets([fmt_call(d) for d in rz.get("details") or []])
         warns = [f"сделка {d['lead_id']}: {d.get('reason', '')[:60]}" for d in (rz.get("skipped_details") or [])]
         errs = [f"сделка {d['lead_id']}: {d.get('error', '')[:80]}" for d in (rz.get("error_details") or [])]
         if errs:
-            parts += ["  ⚠️ ошибки:"] + bullets(errs)
+            parts += ["  [ОШИБКИ]:"] + bullets(errs)
         elif warns:
-            parts += ["  ⏸ пропуски:"] + bullets(warns[:4])
+            parts += ["  [пропуски]:"] + bullets(warns[:4])
 
     if ch is None:
-        parts.append("💬 Чаты Авито: прогон не отработал (см. лог GitHub)")
+        parts.append("[ЧАТЫ] прогон не отработал (см. лог GitHub)")
     else:
-        parts.append(f"💬 Чаты: обработано {ch['acted']}, пропущено {ch['skipped']}, ошибок {ch['errors']} "
+        parts.append(f"[ЧАТЫ] обработано {ch['acted']}, пропущено {ch['skipped']}, ошибок {ch['errors']} "
                      f"(заявок в лотке {ch['unsorted_chats']})")
         parts += bullets([fmt_chat(d) for d in ch.get("details") or []])
         sk = [d.get("reason", "")[:70] for d in (ch.get("skipped_details") or [])]
         er = [d.get("error", "")[:80] for d in (ch.get("error_details") or [])]
         if er:
-            parts += ["  ⚠️ ошибки:"] + bullets(er)
+            parts += ["  [ОШИБКИ]:"] + bullets(er)
         elif sk:
-            parts += ["  ⏸ пропуски:"] + bullets(sk[:4])
+            parts += ["  [пропуски]:"] + bullets(sk[:4])
 
     note = "\n".join(parts)
     print(note)
