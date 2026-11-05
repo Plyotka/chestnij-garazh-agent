@@ -214,6 +214,17 @@ def run():
     if not KIMI_KEY:
         raise RuntimeError("MOONSHOT_API_KEY не задан")
 
+    # рабочее окно (мск): клиентам не пишем ночью, поэтому вне окна
+    # весь чат-контур молчит (как razbor.py). В DRY_RUN окно не действует.
+    if not DRY_RUN:
+        def _hm(s):
+            h, m = s.split(":")
+            return int(h) * 60 + int(m)
+        cur = now.hour * 60 + now.minute
+        if not (_hm(os.environ.get("WINDOW_START", "8:30")) <= cur <= _hm(os.environ.get("WINDOW_END", "18:30"))):
+            log("вне рабочего окна — выход без действий")
+            return {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True}
+
     tok = avito_token()
     acc = amo_get("/api/v4/account")
     log(f"amo: {acc.get('name') or acc.get('subdomain') or 'ok'}; avito: токен получен")
