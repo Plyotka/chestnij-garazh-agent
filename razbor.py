@@ -469,23 +469,25 @@ def apply_result(lead, r, now, phone_guess=None):
 
     if cat == 1:
         # Правило 28.10 (уточнено): суть непонятна (ни о чём / обрыв / неясно что за машина) → Бадри.
-        # Бадри получает: пропущенные без контакта + звонки без сути. Константин — только категории 2 и 3.
+        # Контур звонков целиком на Бадри (решение владельца 06.11).
         resp_id = BADRI
         if cur_status == ST_NERAZOB:
             patch["status_id"] = ST_FIRST
         task_text = "Kimi для Бадри: Перезвонить/актуализировать"
         task_due = today_18_msk()
     elif cat == 2:
-        resp_id = KONSTANTIN
+        # Решение владельца 06.11: контур ЗВОНКОВ целиком на Бадри (он звонит).
+        # Константин — только чат-контур Авито (chats.py), его толкает переписка.
+        resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_TEPLY]:
             patch["status_id"] = ST_TEPLY
-        task_text = "Kimi для Константина: Когда приедет?"
+        task_text = "Kimi для Бадри: Когда приедет?"
         task_due = tomorrow_10_msk()
     elif cat == 3:
-        resp_id = KONSTANTIN
+        resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_PRIEDET]:
             patch["status_id"] = ST_PRIEDET
-        task_text = "Kimi для Константина: Приехал?"
+        task_text = "Kimi для Бадри: Приехал?"
         arr = r.get("arrival")
         now_ts = int(now.timestamp())
         if isinstance(arr, (int, float)) and now_ts - 3600 <= arr <= now_ts + 30 * 86400:
