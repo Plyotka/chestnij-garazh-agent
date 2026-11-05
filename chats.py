@@ -18,7 +18,7 @@
   - Агент не пишет клиенту ничего, кроме утверждённых шаблонов TEMPLATES ниже.
   - Если телефон клиент уже оставил — агент НЕ пишет, только двигает CRM.
   - Чаты без ответа сервиса пропускаются молча (их ведёт Бадри).
-  - Только 9:00–19:00 мск (рабочее окно проверяет и razbor.py, дубль тут не мешает).
+  - Только 9:00–20:00 мск (рабочее окно проверяется тут же; razbor.py дублирует).
 
 Переменные окружения:
   AVITO_CLIENT_ID / AVITO_CLIENT_SECRET — приложение Авито (GitHub Secrets)
@@ -221,7 +221,7 @@ def run():
             h, m = s.split(":")
             return int(h) * 60 + int(m)
         cur = now.hour * 60 + now.minute
-        if not (_hm(os.environ.get("WINDOW_START", "8:30")) <= cur <= _hm(os.environ.get("WINDOW_END", "18:30"))):
+        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "20:00"))):
             log("вне рабочего окна — выход без действий")
             return {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True}
 

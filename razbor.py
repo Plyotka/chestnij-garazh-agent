@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Разбор звонков «Честный Гараж» — Yandex Cloud Serverless Function.
-Триггер-таймер 3 раза в день (8:30 / 14:00 / 16:30 мск).
+Облачный триггер: GitHub Actions каждые 30 минут, окно 9:00–20:00 мск.
 Транскрипцию звонков делает «Войси» (заметки уже в карточках amo).
 Функция: разбирает свежие расшифровки, называет сделку/контакт,
 маршрутизирует по схеме Бадри/Константин, ставит задачи, пишет разбор.
@@ -555,7 +555,7 @@ def run():
             h, m = s.split(":")
             return int(h) * 60 + int(m)
         cur = now.hour * 60 + now.minute
-        if not (_hm(os.environ.get("WINDOW_START", "8:30")) <= cur <= _hm(os.environ.get("WINDOW_END", "18:30"))):
+        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "20:00"))):
             log("вне рабочего окна — выход без действий")
             return {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True}
 

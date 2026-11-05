@@ -2,12 +2,10 @@ name: chg-razbor
 
 on:
   schedule:
-    # 08:27, 08:57 МСК (UTC+3)
-    - cron: "27,57 5 * * *"
-    # 09:00–17:30 МСК каждые 30 минут
-    - cron: "*/30 6-14 * * *"
-    # 18:27 МСК
-    - cron: "27 15 * * *"
+    # 09:00–19:30 МСК (UTC+3) каждые 30 минут
+    - cron: "*/30 6-16 * * *"
+    # 19:57 МСК — последний вечерний прогон до дедлайна 20:00
+    - cron: "57 16 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -16,14 +14,14 @@ on:
         default: "false"
         type: string
       window_start:
-        description: "Начало рабочего окна, МСК (по умолчанию 8:30)"
+        description: "Начало рабочего окна, МСК (по умолчанию 9:00)"
         required: false
-        default: "8:30"
+        default: "9:00"
         type: string
       window_end:
-        description: "Конец рабочего окна, МСК (по умолчанию 18:30)"
+        description: "Конец рабочего окна, МСК (по умолчанию 20:00)"
         required: false
-        default: "18:30"
+        default: "20:00"
         type: string
 
 # прогоны не должны пересекаться: следующий ждёт завершения предыдущего
@@ -44,8 +42,8 @@ jobs:
       AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
       AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-      WINDOW_START: ${{ github.event.inputs.window_start || '8:30' }}
-      WINDOW_END: ${{ github.event.inputs.window_end || '18:30' }}
+      WINDOW_START: ${{ github.event.inputs.window_start || '9:00' }}
+      WINDOW_END: ${{ github.event.inputs.window_end || '20:00' }}
       KIMI_MODEL: kimi-k2.6
       MAX_LEADS_PER_RUN: "30"
       CHAT_WINDOW_DAYS: "3"
