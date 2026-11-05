@@ -220,6 +220,55 @@ def find_chat_for_item(item, by_name):
     return (best, best_d) if best_d <= 120 else (None, best_d)
 
 
+def send_pending_templates(tok):
+    """Дневной дожим: ночные прогоны (NO_SEND) не пишут клиентам, а оставляют
+    в заметке сделки 'chat_id=…: «шаблон»'. Здесь находим такие сделки и шлём.
+    Работает в конце каждого дневного прогона; повторной отправки не будет —
+    после отправки появляется заметка «Отправлено клиенту»."""
+    from_ts = int((datetime.now(MSK) - timedelta(days=4)).timestamp())
+    try:
+        leads = http("GET",
+                     f"{AMO_BASE}/api/v4/leads?filter[pipeline_id][]=11282498"
+                     f"&filter[statuses][]={ST_FIRST}&filter[statuses][]={ST_TEPLY}&filter[statuses][]={ST_PRIEDET}"
+                     f"&filter[updated_at][from]={from_ts}&limit=250", token=AMO_TOKEN)
+    except Exception as e:
+        log(f"дожим: не удалось получить сделки ({e})")
+        return 0
+    sent_n = 0
+    pat = re.compile(r"chat_id=(\S+?): «(.+?)»")
+    for l in embedded(leads, "leads"):
+        tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
+        if TAG_CHAT not in tags:
+            continue
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{l['id']}/notes?limit=100"), "notes")
+        except Exception:
+            continue
+        pending = sent = None
+        for n in sorted(notes, key=lambda x: x.get("created_at", 0)):
+            t = ((n.get("params") or {}).get("text") or "")
+            if "chat_id=" in t and "НЕ отправлен" in t:
+                m = pat.search(t)
+                if m:
+                    pending = m.groups()
+            if "Отправлено клиенту" in t:
+                sent = True
+        if not pending or sent:
+            continue
+        cid, tpl = pending
+        try:
+            http("POST",
+                 f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}/chats/{cid}/messages",
+                 token=tok, body={"message": {"text": tpl}, "type": "text"})
+            amo("POST", f"/api/v4/leads/{l['id']}/notes", [{"note_type": "common", "params": {
+                "text": f"Отправлено клиенту (дожим дневного прогона): «{tpl}»"}}])
+            sent_n += 1
+            log(f"  дожим: сделка {l['id']}, chat {cid[:10]}…, шаблон отправлен")
+        except Exception as e:
+            log(f"  дожим: сделка {l['id']}: ошибка отправки ({e})")
+    return sent_n
+
+
 def run():
     now = datetime.now(MSK)
     log(f"=== Чат-контур v2 {'(DRY_RUN) ' if DRY_RUN else ''}{now.strftime('%d.%m.%Y %H:%M')} мск ===")
@@ -395,9 +444,11 @@ def run():
                 pass
 
             # агент сам пишет клиенту — строго по шаблону и только если телефона ещё нет.
-            # В NO_SEND клиенту не пишем (ночь): вместо отправки — задача на 9:00 с текстом шаблона.
-            # Решение владельца 06.11: всё по Авито-переписке — на Константина (агент толкает диалог).
+            # Ночь (NO_SEND): клиенту не пишем и НИКАКИХ задач на отправку не ставим —
+            # в заметку пишем chat_id + шаблон, первый дневной прогон дошлёт сам (send_pending).
+            # Одна задача на сделку — только контрольная (решение владельца 06.11).
             sent = None
+            pending = None
             if interest and not phone:
                 tpl = None
                 if r.get("next_step") == "phone" or r.get("said_will_come"):
@@ -406,9 +457,9 @@ def run():
                     tpl = T_WHEN
                 if tpl:
                     if NO_SEND:
-                        note += f"\nШаблон НЕ отправлен (ночной прогон NO_SEND): «{tpl}»"
-                        tasks.append((f"Kimi для Константина: в чат Авито отправить клиенту: «{tpl}»",
-                                      KONSTANTIN, next_9_msk()))
+                        pending = (cid, tpl)
+                        note += (f"\nШаблон НЕ отправлен (ночь, дождётся дневного прогона), "
+                                 f"chat_id={cid}: «{tpl}»")
                     else:
                         http("POST",
                              f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}/chats/{cid}/messages",
@@ -424,7 +475,7 @@ def run():
                     "complete_till": t[2], "entity_id": new_id, "entity_type": "leads"} for t in tasks])
 
             acted.append({"lead": new_id, "client": cname, "interest": interest,
-                          "sent": bool(sent), "no_send": bool(NO_SEND and interest and not phone and tpl)})
+                          "sent": bool(sent), "pending": bool(pending)})
             if au:
                 seen_uid[au] = new_id
             log(f"  {cname}: сделка {new_id}, interest={interest}" + (", написали клиенту" if sent else ""))
@@ -432,11 +483,20 @@ def run():
             errors.append({"uid": uid, "error": str(e)[:250]})
             log(f"  ОШИБКА {cname}: {e}")
 
+    # дневной дожим ночных шаблонов (NO_SEND ничего не шлёт, только помечает)
+    followups = 0
+    if not DRY_RUN and not NO_SEND:
+        try:
+            followups = send_pending_templates(tok)
+        except Exception as e:
+            log(f"дожим: ошибка ({e})")
+
     summary = {"run": now.strftime("%d.%m.%Y %H:%M"), "dry_run": DRY_RUN,
                "fresh_chats": len(fresh), "unsorted_chats": len(unsorted),
                "acted": len(acted), "skipped": len(skipped), "errors": len(errors),
+               "followups": followups,
                "details": acted, "skipped_details": skipped, "error_details": errors}
-    log(f"=== Итог: обработано {len(acted)}, пропущено {len(skipped)}, ошибок {len(errors)} ===")
+    log(f"=== Итог: обработано {len(acted)}, пропущено {len(skipped)}, ошибок {len(errors)}, дожим {followups} ===")
     print("SUMMARY_JSON:" + json.dumps(summary, ensure_ascii=False))
 
 

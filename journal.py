@@ -61,7 +61,12 @@ def fmt_chat(d):
         return f"DRY {d.get('client')}"
     if d.get("interest") is False:
         return f"{d.get('client')} → сделка {d.get('lead')}, закрыт (нет интереса)"
-    sent = "написали клиенту" if d.get("sent") else ("шаблон→задача Бадри" if d.get("no_send") else "")
+    if d.get("sent"):
+        sent = "написали клиенту"
+    elif d.get("pending"):
+        sent = "шаблон → дневной дожим"
+    else:
+        sent = ""
     base = f"{d.get('client')} → сделка {d.get('lead')}, интерес"
     return f"{base} · {sent}" if sent else base
 
@@ -102,7 +107,7 @@ def main():
         parts.append("[ЧАТЫ] прогон не отработал (см. лог GitHub)")
     else:
         parts.append(f"[ЧАТЫ] обработано {ch['acted']}, пропущено {ch['skipped']}, ошибок {ch['errors']} "
-                     f"(заявок в лотке {ch['unsorted_chats']})")
+                     f"(заявок в лотке {ch['unsorted_chats']}, дожим отправлено {ch.get('followups', 0)})")
         parts += bullets([fmt_chat(d) for d in ch.get("details") or []])
         sk = [d.get("reason", "")[:70] for d in (ch.get("skipped_details") or [])]
         er = [d.get("error", "")[:80] for d in (ch.get("error_details") or [])]
