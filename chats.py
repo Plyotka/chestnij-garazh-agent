@@ -395,7 +395,8 @@ def run():
                 pass
 
             # агент сам пишет клиенту — строго по шаблону и только если телефона ещё нет.
-            # В NO_SEND клиенту не пишем (ночь): вместо отправки — задача Бадри на 9:00 с текстом шаблона.
+            # В NO_SEND клиенту не пишем (ночь): вместо отправки — задача на 9:00 с текстом шаблона.
+            # Решение владельца 06.11: всё по Авито-переписке — на Константина (агент толкает диалог).
             sent = None
             if interest and not phone:
                 tpl = None
@@ -406,8 +407,8 @@ def run():
                 if tpl:
                     if NO_SEND:
                         note += f"\nШаблон НЕ отправлен (ночной прогон NO_SEND): «{tpl}»"
-                        tasks.append((f"Kimi для Бадри: в чат Авито отправить клиенту: «{tpl}»",
-                                      BADRI, next_9_msk()))
+                        tasks.append((f"Kimi для Константина: в чат Авито отправить клиенту: «{tpl}»",
+                                      KONSTANTIN, next_9_msk()))
                     else:
                         http("POST",
                              f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}/chats/{cid}/messages",
