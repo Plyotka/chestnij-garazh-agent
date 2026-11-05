@@ -152,7 +152,9 @@ def main():
         prev = prev_items.get(iid) or {}
         was_live = prev.get("status") == "active" or (
             not prev and (c.get("finish") or "") > now.isoformat())
-        if was_live and c.get("status") != "active":
+        # тревога и на свежепавших, и на тех, кто лежит трупом с прошлого прогона
+        # (статус "old" = истёк срок; пока не оживили — задача висит, дубль не создаётся)
+        if (was_live and c.get("status") != "active") or c.get("status") == "old":
             expired_now.append(iid)
         elif c.get("status") == "active" and c.get("finish") and \
                 now.isoformat() < c["finish"] <= today_end:
