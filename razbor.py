@@ -172,26 +172,47 @@ def tomorrow_10_msk():
 
 # ---------------- задачи ----------------
 
+# ключ действия задачи — по нему понимаем, что это «та же» задача
+TASK_KEYS = ("Перезвонить/актуализировать", "Когда приедет?", "Приехал?",
+             "Актуализировать обращение", "отправить клиенту")
+
+
+def task_key(text):
+    for k in TASK_KEYS:
+        if k in text:
+            return k
+    return text[:30]
+
+
 def upsert_task(lead_id, text, responsible_id, complete_till):
-    """Не дублирует задачи: обновляет открытую задачу Kimi, иначе создаёт новую."""
+    """Правило владельца 06.11: закрытые задачи НИКОГДА не редактируются и не
+    воскрешаются (запросы ниже фильтруют is_completed=0). Если нужное действие
+    уже есть открытым — обновляем его (ответственный/срок/текст). Если действие
+    сменилось — старую открытую ЗАКРЫВАЕМ (не редактируем), создаём НОВУЮ.
+    Если ничего нет — создаём новую."""
     resp = amo_get(
         f"/api/v4/tasks?filter[entity_id]={lead_id}&filter[entity_type][]=leads&filter[is_completed]=0&limit=100"
     )
     open_tasks = embedded(resp, "tasks")
     mine = [t for t in open_tasks if (t.get("text") or "").startswith("Kimi для")]
-    if mine:
+    want = task_key(text)
+    same = [t for t in mine if task_key(t.get("text") or "") == want]
+    if same:
         amo("PATCH", "/api/v4/tasks", [
             {"id": t["id"], "text": text, "responsible_user_id": responsible_id, "complete_till": complete_till}
-            for t in mine
+            for t in same
         ])
-    else:
-        amo("POST", "/api/v4/tasks", [{
-            "text": text,
-            "responsible_user_id": responsible_id,
-            "complete_till": complete_till,
-            "entity_id": lead_id,
-            "entity_type": "leads",
-        }])
+        return
+    # действие сменилось или задач нет: старые открытые закрываем, новую создаём
+    if mine:
+        amo("PATCH", "/api/v4/tasks", [{"id": t["id"], "is_completed": True} for t in mine])
+    amo("POST", "/api/v4/tasks", [{
+        "text": text,
+        "responsible_user_id": responsible_id,
+        "complete_till": complete_till,
+        "entity_id": lead_id,
+        "entity_type": "leads",
+    }])
 
 
 def close_my_tasks(lead_id):
