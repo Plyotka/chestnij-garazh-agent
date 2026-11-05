@@ -1,0 +1,36 @@
+name: chg-avitolog-monitor
+
+on:
+  schedule:
+    # 09:00–20:30 МСК (UTC+3) каждые 30 минут
+    - cron: "*/30 6-17 * * *"
+  workflow_dispatch:
+
+# не пересекаемся с прогоном разбора и с собой
+concurrency:
+  group: chg-avitolog
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
+      AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
+      AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Авито-монитор (баланс, истечения, активация, аномалии) — без LLM
+        run: python3 avitolog/monitor.py | tee avitolog/monitor.out
+      - name: Сохранить состояние мониторинга
+        if: always()
+        run: |
+          git config user.email "agent@chg.local"
+          git config user.name "chg-agent"
+          git add avitolog/state.json
+          git diff --cached --quiet || git commit -m "avitolog: state $(date -u +%Y-%m-%dT%H:%M)"
+          git push
