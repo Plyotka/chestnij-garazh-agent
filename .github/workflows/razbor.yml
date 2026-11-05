@@ -13,6 +13,11 @@ on:
         required: false
         default: "false"
         type: string
+      no_send:
+        description: "NO_SEND (true — CRM разбираем, но клиенту не пишем; вместо отправки — задача с текстом шаблона)"
+        required: false
+        default: "false"
+        type: string
       window_start:
         description: "Начало рабочего окна, МСК (по умолчанию 9:00)"
         required: false
@@ -42,6 +47,7 @@ jobs:
       AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
       AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      NO_SEND: ${{ github.event.inputs.no_send || 'false' }}
       WINDOW_START: ${{ github.event.inputs.window_start || '9:00' }}
       WINDOW_END: ${{ github.event.inputs.window_end || '20:00' }}
       KIMI_MODEL: kimi-k2.6

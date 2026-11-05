@@ -45,6 +45,9 @@ KIMI_BASE = os.environ.get("KIMI_BASE", "https://api.moonshot.ai").rstrip("/")
 KIMI_KEY = os.environ.get("MOONSHOT_API_KEY", "")
 KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.6")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+# NO_SEND=1 — CRM разбираем как обычно, но клиенту не пишем: вместо отправки
+# шаблона ставим задачу человеку на 9:00 с текстом шаблона (ночные прогоны).
+NO_SEND = os.environ.get("NO_SEND", "false").lower() == "true"
 WINDOW_DAYS = int(os.environ.get("CHAT_WINDOW_DAYS", "3"))
 MAX_PER_RUN = int(os.environ.get("MAX_CHATS_PER_RUN", "6"))
 
@@ -185,6 +188,16 @@ def tomorrow_10_msk():
     return int(datetime(d.year, d.month, d.day, 10, 0, tzinfo=MSK).timestamp())
 
 
+def next_9_msk():
+    """Ближайшие 9:00 мск: сегодня, если ещё не наступили, иначе завтра."""
+    now = datetime.now(MSK)
+    d = now.date()
+    ts = datetime(d.year, d.month, d.day, 9, 0, tzinfo=MSK)
+    if now >= ts:
+        ts += timedelta(days=1)
+    return int(ts.timestamp())
+
+
 def norm_phone(raw):
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits[0] in "78":
@@ -315,7 +328,7 @@ def run():
             ])
 
             patch = {"id": new_id, "name": lead_name}
-            task = None
+            tasks = []
             if not interest:
                 patch["status_id"] = ST_CLOSED
                 patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
@@ -324,11 +337,11 @@ def run():
                 if r.get("said_will_come") or phone:
                     patch["status_id"] = ST_PRIEDET
                     patch["responsible_user_id"] = KONSTANTIN
-                    task = ("Kimi для Константина: Приехал?", KONSTANTIN, tomorrow_10_msk())
+                    tasks.append(("Kimi для Константина: Приехал?", KONSTANTIN, tomorrow_10_msk()))
                 else:
                     patch["status_id"] = ST_TEPLY
                     patch["responsible_user_id"] = KONSTANTIN
-                    task = ("Kimi для Константина: Когда приедет?", KONSTANTIN, tomorrow_10_msk())
+                    tasks.append(("Kimi для Константина: Когда приедет?", KONSTANTIN, tomorrow_10_msk()))
 
             amo("PATCH", "/api/v4/leads", [patch])
 
@@ -343,7 +356,8 @@ def run():
             elif not interest:
                 pass
 
-            # агент сам пишет клиенту — строго по шаблону и только если телефона ещё нет
+            # агент сам пишет клиенту — строго по шаблону и только если телефона ещё нет.
+            # В NO_SEND клиенту не пишем (ночь): вместо отправки — задача Бадри на 9:00 с текстом шаблона.
             sent = None
             if interest and not phone:
                 tpl = None
@@ -352,20 +366,26 @@ def run():
                 elif r.get("next_step") == "when":
                     tpl = T_WHEN
                 if tpl:
-                    http("POST",
-                         f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}/chats/{cid}/messages",
-                         token=tok, body={"message": {"text": tpl}, "type": "text"})
-                    sent = tpl
-                    note += f"\nОтправлено клиенту: «{tpl}»"
+                    if NO_SEND:
+                        note += f"\nШаблон НЕ отправлен (ночной прогон NO_SEND): «{tpl}»"
+                        tasks.append((f"Kimi для Бадри: в чат Авито отправить клиенту: «{tpl}»",
+                                      BADRI, next_9_msk()))
+                    else:
+                        http("POST",
+                             f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}/chats/{cid}/messages",
+                             token=tok, body={"message": {"text": tpl}, "type": "text"})
+                        sent = tpl
+                        note += f"\nОтправлено клиенту: «{tpl}»"
 
             amo("POST", f"/api/v4/leads/{new_id}/notes", [
                 {"note_type": "common", "params": {"text": note}}])
-            if task:
+            if tasks:
                 amo("POST", "/api/v4/tasks", [{
-                    "text": task[0], "responsible_user_id": task[1],
-                    "complete_till": task[2], "entity_id": new_id, "entity_type": "leads"}])
+                    "text": t[0], "responsible_user_id": t[1],
+                    "complete_till": t[2], "entity_id": new_id, "entity_type": "leads"} for t in tasks])
 
-            acted.append({"lead": new_id, "client": cname, "interest": interest, "sent": bool(sent)})
+            acted.append({"lead": new_id, "client": cname, "interest": interest,
+                          "sent": bool(sent), "no_send": bool(NO_SEND and interest and not phone and tpl)})
             log(f"  {cname}: сделка {new_id}, interest={interest}" + (", написали клиенту" if sent else ""))
         except Exception as e:
             errors.append({"uid": uid, "error": str(e)[:250]})
