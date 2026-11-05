@@ -153,8 +153,15 @@ def classify(transcript, current_name=""):
 # ---------------- время ----------------
 
 def today_18_msk():
-    d = datetime.now(MSK).date()
-    return int(datetime(d.year, d.month, d.day, 18, 0, tzinfo=MSK).timestamp())
+    """Дедлайн 'к концу рабочего дня'. После 18:00 — следующее рабочее утро (10:00),
+    чтобы ночные прогоны не ставили уже просроченные задачи."""
+    now = datetime.now(MSK)
+    d = now.date()
+    ts = datetime(d.year, d.month, d.day, 18, 0, tzinfo=MSK)
+    if now > ts:
+        ts += timedelta(days=1)
+        ts = ts.replace(hour=10, minute=0)
+    return int(ts.timestamp())
 
 
 def tomorrow_10_msk():
