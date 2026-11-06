@@ -67,6 +67,30 @@ T_WHEN = ("Здравствуйте! Подскажите, когда плани
           "Подберём удобное время.")
 T_PHONE = ("Отлично! Оставьте, пожалуйста, номер телефона — зафиксируем запись "
            "и перезвоним подтвердить.")
+# шаги эскалации дожима (решение владельца 06.11): не чаще одного касания
+# в сутки, привязка к словам клиента о приезде/переносе.
+T_ACTUAL = ("Здравствуйте! Подскажите, актуален ещё вопрос? Работаем с 9:00 "
+            "до 20:00, в субботу до 17:00 — подберём удобное время.")
+T_SOFT = ("Здравствуйте! Если вопрос ещё актуален — напишите, подберём время "
+          "и посчитаем точно по вашей машине.")
+T_CONFIRM = ("Отлично! Работаем до 20:00 (в субботу до 17:00). К какому часу "
+             "планируете? Зафиксирую запись.")
+T_NEWDATE = ("Хорошо, переносим без проблем. На какой день будет удобно? "
+             "Подберём время.")
+# регулярка chat_id в заметках (движок дожима находит чат сделки по ней)
+CHAT_ID_RE = re.compile(r"chat_id=(u2i-[\w~\-]+)")
+# клиент «сам наберёт» → не дожимаем, напоминаем через 4 дня (схема владельца)
+SAM_NABERET_RE = re.compile(
+    r"подумаю|подумать|напишу (вам )?позже|сам (наберу|позвоню)|перезвоню|"
+    r"свяжусь (с вами|позже)|на следующей неделе", re.IGNORECASE)
+# клиент называет день/время приезда → подтверждаем и фиксируем запись
+SCHED_RE = re.compile(
+    r"сегодня|завтра|послезавтра|суббот|воскресен|понедельник|вторник|среду|"
+    r"четверг|пятницу|\b\d{1,2}[./ ]\d{1,2}\b|приеду|подъеду|заеду|привезу|"
+    r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}", re.IGNORECASE)
+FUP_SILENCE_FIRST = 20   # ч тишины после нашего ответа → первый дожим
+FUP_GAP = 20             # минимум ч между любыми отправками клиенту
+FUP_GAP_2 = 48           # ч между первым и вторым дожимом
 
 SYSTEM = """Ты — оператор сделок автосервиса «Честный Гараж». По переписке чата Авито определи, есть ли у клиента интерес к услуге, и верни СТРОГО один JSON-объект.
 
@@ -269,6 +293,172 @@ def send_pending_templates(tok):
     return sent_n
 
 
+def followup_engine(tok):
+    """Регулярный дожим тёплых чат-сделок (схема владельца 06.11).
+
+    Для каждой открытой сделки с тегом «Чат» находим её чат Авито по заметке
+    chat_id=… и смотрим ПОСЛЕДНИЕ сообщения (не стартовый вопрос — это баг
+    кейса Дмитрия АКПП, где финал «Понял, спасибо» = отказ):
+      1. клиент ответил, мы нет (тишина >2 ч):
+         - «подумаю / сам наберу / на следующей неделе» → НЕ дожимаем,
+           ставим напоминание через 4 дня со сценарием возврата;
+         - называет день/время → шлём T_CONFIRM, сделку в «Приедет»,
+           задача за день до приезда «всё получается?»;
+         - вопрос по сути — ставим задачу «Ответить в чате» (человеку),
+           сами не пишем (переписку пока ведёт сервис).
+      2. мы ответили последними, клиент молчит:
+         - 20–48 ч → T_ACTUAL (не чаще 1 касания в сутки);
+         - ещё 48 ч → T_SOFT; дальше (>96 ч, 2+ касания) → задача
+           «дожать вручную» Константину, сам больше не пишем.
+      3. клиент просит перенос → T_NEWDATE и ждём новую дату.
+    Защита от спама: между любыми отправками ≥ FUP_GAP ч, всего ≤2 дожима.
+    """
+    now = datetime.now(MSK)
+    from_ts = int((now - timedelta(days=14)).timestamp())
+    leads = amo_get(f"/api/v4/leads?filter[pipeline_id][]=11282498"
+                    f"&filter[statuses][]={ST_FIRST}&filter[statuses][]={ST_TEPLY}"
+                    f"&filter[statuses][]={ST_PRIEDET}"
+                    f"&filter[updated_at][from]={from_ts}&limit=250&with=tasks")
+    done = {"confirm": 0, "actual": 0, "soft": 0, "newdate": 0,
+            "sam_naberet": 0, "human": 0, "manual": 0, "skip": 0}
+
+    def send(lead_id, cid, tpl, key):
+        http("POST", f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}"
+                     f"/chats/{cid}/messages", token=tok,
+             body={"message": {"text": tpl}, "type": "text"})
+        amo("POST", f"/api/v4/leads/{lead_id}/notes",
+            [{"note_type": "common", "params": {
+                "text": f"Отправлено клиенту ({key}): «{tpl}»"}}])
+        done[key] = done.get(key, 0) + 1
+        log(f"  дожим+ {lead_id}: {key} → chat {cid[:10]}…")
+
+    def open_tasks(l):
+        return [t for t in embedded(l, "tasks") if not t.get("is_completed")]
+
+    def add_task(lead_id, text, till_ts):
+        amo("POST", "/api/v4/tasks", [{
+            "text": text, "responsible_user_id": KONSTANTIN,
+            "complete_till": int(till_ts), "entity_id": lead_id,
+            "entity_type": "leads"}])
+
+    for l in embedded(leads, "leads"):
+        tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
+        if TAG_CHAT not in tags:
+            continue
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{l['id']}/notes?limit=100"),
+                             "notes")
+        except Exception:
+            continue
+        cid, last_sent_ts, n_sent = None, 0, 0
+        sam_due = None
+        for n in sorted(notes, key=lambda x: x.get("created_at") or 0):
+            t = ((n.get("params") or {}).get("text") or "")
+            m = CHAT_ID_RE.search(t)
+            if m:
+                cid = m.group(1)
+            if "Отправлено клиенту" in t:
+                n_sent += 1
+                last_sent_ts = max(last_sent_ts, n.get("created_at") or 0)
+            if "сам наберёт — вернуться" in t:
+                mm = re.search(r"после (\d+)", t)
+                if mm:
+                    sam_due = int(mm.group(1))
+        if not cid:
+            done["skip"] += 1
+            continue
+        try:
+            msgs = http("GET", f"https://api.avito.ru/messenger/v3/accounts/"
+                               f"{AVITO_UID}/chats/{cid}/messages/?limit=50",
+                        token=tok).get("messages") or []
+        except Exception as e:
+            log(f"  дожим+ {l['id']}: не прочитан чат ({e})")
+            continue
+        ins = [m for m in msgs if m.get("direction") == "in"
+               and not msg_text(m).startswith("[Системное")]
+        outs = [m for m in msgs if m.get("direction") == "out"]
+        if not outs:  # Бадри ещё не отвечал — агент молчит (жёсткое правило)
+            continue
+        last_in = max((m.get("created") or 0) for m in ins) if ins else 0
+        last_out = max((m.get("created") or 0) for m in outs) if outs else 0
+        nowts = int(now.timestamp())
+        tasks = open_tasks(l)
+        try:
+            if sam_due and nowts < sam_due:
+                continue  # клиент просил сам набрать — ждём срока
+            # антиспам-зазор: после любой нашей отправки ≥FUP_GAP ч тишины
+            if n_sent > 0 and nowts - last_sent_ts < FUP_GAP * 3600:
+                continue
+            if sam_due and nowts >= sam_due:
+                send(l["id"], cid, T_SOFT, "soft")
+                continue
+            if last_in > last_out:  # клиент ждёт нашего ответа
+                if nowts - last_in < 2 * 3600:
+                    continue
+                last_client = next(msg_text(m) for m in reversed(msgs)
+                                   if m.get("direction") == "in")
+                if SAM_NABERET_RE.search(last_client):
+                    due = last_in + 4 * 86400
+                    amo("POST", f"/api/v4/leads/{l['id']}/notes",
+                        [{"note_type": "common", "params": {"text":
+                            f"Клиент «сам наберёт — вернуться» после {due} "
+                            f"(4 дня, схема владельца). Дожим до срока не шлём."}}])
+                    if not tasks:
+                        add_task(l["id"],
+                                 "Kimi для Константина: написать клиенту "
+                                 "(обещал сам набрать, прошло 4 дня) — "
+                                 "мягкий возврат в диалог", due)
+                    done["sam_naberet"] += 1
+                    continue
+                if "перенес" in last_client.lower() or "не получится" in \
+                        last_client.lower() or "переношу" in last_client.lower():
+                    send(l["id"], cid, T_NEWDATE, "newdate")
+                    continue
+                if SCHED_RE.search(last_client):
+                    if not any("Отправлено клиенту" in ((n.get("params") or {})
+                               .get("text") or "") and
+                               (n.get("created_at") or 0) > last_in
+                               for n in notes):
+                        send(l["id"], cid, T_CONFIRM, "confirm")
+                        amo("PATCH", "/api/v4/leads", [{"id": l["id"],
+                             "status_id": ST_PRIEDET,
+                             "responsible_user_id": KONSTANTIN}])
+                        d = (now + timedelta(days=1)).date()
+                        add_task(l["id"], "Kimi для Константина: за день до "
+                                 "приезда написать «всё получается? "
+                                 "Приедете?»",
+                                 datetime(d.year, d.month, d.day, 10, 0,
+                                          tzinfo=MSK).timestamp())
+                    continue
+                # вопрос по сути — нужен человек
+                if not tasks:
+                    add_task(l["id"],
+                             "Kimi для Константина: Ответить в чате Авито — "
+                             "клиент ждёт ответа по сути",
+                             nowts + 3 * 3600)
+                    done["human"] += 1
+                continue
+            # мы ответили последними — клиент молчит
+            silence = nowts - max(last_out, last_sent_ts)
+            if n_sent >= 2 and silence >= 96 * 3600:
+                if not tasks:
+                    add_task(l["id"], "Kimi для Константина: дожать сделку "
+                             "вручную — 2 автокасания не дали ответа",
+                             nowts + 86400)
+                    done["manual"] += 1
+                continue
+            if n_sent == 0 and silence >= FUP_SILENCE_FIRST * 3600:
+                send(l["id"], cid, T_ACTUAL, "actual")
+            elif n_sent == 1 and silence >= FUP_GAP_2 * 3600:
+                send(l["id"], cid, T_SOFT, "soft")
+            else:
+                done["skip"] += 1
+        except Exception as e:
+            log(f"  дожим+ {l['id']}: ошибка ({e})")
+    log(f"дожим+ движок: {json.dumps(done, ensure_ascii=False)}")
+    return done
+
+
 def run():
     now = datetime.now(MSK)
     log(f"=== Чат-контур v2 {'(DRY_RUN) ' if DRY_RUN else ''}{now.strftime('%d.%m.%Y %H:%M')} мск ===")
@@ -411,6 +601,7 @@ def run():
                 f"Авто: {r.get('car') or '—'}",
                 f"Запрос: {request or '—'}",
                 f"Итог: {'интерес' if interest else 'нет интереса'} — {r.get('summary') or ''}",
+                f"chat_id={cid}",
             ])
 
             patch = {"id": new_id, "name": lead_name,
@@ -490,6 +681,11 @@ def run():
             followups = send_pending_templates(tok)
         except Exception as e:
             log(f"дожим: ошибка ({e})")
+        # регулярный дожим тёплых сделок: эскалация по схеме владельца 06.11
+        try:
+            followup_engine(tok)
+        except Exception as e:
+            log(f"дожим+ движок: ошибка ({e})")
 
     summary = {"run": now.strftime("%d.%m.%Y %H:%M"), "dry_run": DRY_RUN,
                "fresh_chats": len(fresh), "unsorted_chats": len(unsorted),
