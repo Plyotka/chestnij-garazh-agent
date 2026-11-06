@@ -87,6 +87,8 @@ def main():
 
     if rz is None:
         parts.append("[ЗВОНКИ] прогон не отработал (см. лог GitHub)")
+    elif rz.get("window_skip"):
+        parts.append("[ЗВОНКИ] вне рабочего окна — прогон пропущен")
     else:
         ov = rz.get("overdue") or {}
         if ov:
