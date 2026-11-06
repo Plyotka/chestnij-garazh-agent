@@ -4,3 +4,4 @@ batch_*.json
 target_urls.json
 _probe*
 _actions_10.py
+.avito_tok

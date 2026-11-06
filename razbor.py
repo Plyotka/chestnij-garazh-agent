@@ -337,16 +337,40 @@ def repair_phones(leads):
 
 
 def find_open_lead_by_phone(phone):
-    """Открытая сделка с таким номером (для дедупликации пропущенных)."""
+    """Открытая сделка с таким номером (для дедупликации пропущенных).
+    Ищем по цифрам в имени сделки, а если не нашли — по контактам с таким
+    телефоном (кейсы 06.11: сделка переименована содержательно, номер живёт
+    только в контакте — имя «Suzuki Alto — промывка печки» не содержит цифр,
+    и старая проверка по имени дубль не видела)."""
     if not phone:
         return None
     digits = re.sub(r"\D", "", phone)
+    if not digits:
+        return None
     resp = amo_get(f"/api/v4/leads?query={digits}&limit=20")
     for l in embedded(resp, "leads"):
         if l.get("status_id") in (ST_SUCCESS, ST_CLOSED):
             continue
         if digits in re.sub(r"\D", "", l.get("name") or ""):
             return l["id"]
+    # fallback: контакт с этим номером → его открытые сделки
+    try:
+        cands = embedded(amo_get(f"/api/v4/contacts?query={digits}&limit=10"), "contacts")
+        for c in cands:
+            detail = amo_get(f"/api/v4/contacts/{c['id']}?with=leads")
+            vals = detail.get("custom_fields_values") or []
+            has = any(
+                v.get("field_id") == PHONE_FIELD
+                and digits in re.sub(r"\D", "", str((val or {}).get("value") or ""))
+                for v in vals for val in (v.get("values") or [])
+            )
+            if not has:
+                continue
+            for ll in embedded(detail, "leads"):
+                if ll.get("status_id") not in (ST_SUCCESS, ST_CLOSED):
+                    return ll["id"]
+    except Exception:
+        pass
     return None
 
 
@@ -537,7 +561,9 @@ def apply_result(lead, r, now, phone_guess=None):
         resp_id = BADRI
         if cur_status == ST_NERAZOB:
             patch["status_id"] = ST_FIRST
-        task_text = f"Kimi для Бадри: Перезвонить/актуализировать. {info}"
+        task_text = (f"Kimi для Бадри: Перезвонить/актуализировать. {info}"
+                     ". Далее: суть выяснилась → сделка в «Тёплые» + задача «Когда приедет?»; "
+                     "3 попытки без ответа → закрыть «Не дозвонились»")
         task_due = today_18_msk()
     elif cat == 2:
         # Решение владельца 06.11: контур ЗВОНКОВ целиком на Бадри (он звонит).
@@ -545,19 +571,22 @@ def apply_result(lead, r, now, phone_guess=None):
         resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_TEPLY]:
             patch["status_id"] = ST_TEPLY
-        task_text = f"Kimi для Бадри: Когда приедет? {info}"
+        task_text = (f"Kimi для Бадри: Когда приедет? {info}"
+                     ". Далее: назвал дату → «Приедет» + задача «Приехал?» к дате; "
+                     "молчит после дожима → актуализировать, потом закрыть")
         task_due = tomorrow_10_msk()
     elif cat == 3:
         resp_id = BADRI
         if STAGE_RANK.get(cur_status, -1) < STAGE_RANK[ST_PRIEDET]:
             patch["status_id"] = ST_PRIEDET
-        task_text = f"Kimi для Бадри: Приехал? {info}"
+        task_text = (f"Kimi для Бадри: Приехал? {info}"
+                     ". Далее: подтвердил приезд → «Приехал»; просит перенос → новая дата "
+                     "+ задача за день до приезда")
+        task_due = tomorrow_10_msk()
         arr = r.get("arrival")
         now_ts = int(now.timestamp())
         if isinstance(arr, (int, float)) and now_ts - 3600 <= arr <= now_ts + 30 * 86400:
             task_due = int(arr)
-        else:
-            task_due = tomorrow_10_msk()
     elif cat == 5:
         patch["status_id"] = ST_CLOSED
         patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
@@ -582,15 +611,20 @@ def apply_result(lead, r, now, phone_guess=None):
         # категория 4 вне «приехал»: только поднять этап, остальное не трогаем
         amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_PRIEHAL}])
 
-    # заметка-разбор (всегда, включая категорию 4)
-    amo("POST", f"/api/v4/leads/{lid}/notes", [
-        {"note_type": "common", "params": {"text": build_note({**r, "category": cat}, now)}}
-    ])
-
+    # Порядок важен (кейс Audi Q5 06.11): сначала ЗАДАЧА, потом заметка.
+    # Если заметка упадёт — на следующем прогоне fresh-расшифровки всё ещё
+    # свежее last_razbor, разбор повторится и upsert_task доведёт задачу
+    # (PATCH по тому же ключу) — операция идемпотентна. Наоборот не было:
+    # заметка без задачи = задача потеряна навсегда.
     if cat in (1, 2, 3):
         upsert_task(lid, task_text, resp_id, task_due)
     elif cat == 5:
         close_my_tasks(lid)
+
+    # заметка-разбор (всегда, включая категорию 4)
+    amo("POST", f"/api/v4/leads/{lid}/notes", [
+        {"note_type": "common", "params": {"text": build_note({**r, "category": cat}, now)}}
+    ])
 
     log(f"  сделка {lid}: категория {cat}, имя «{lead_name}»")
     return {"lead_id": lid, "category": cat, "name": lead_name}
@@ -642,6 +676,115 @@ def process_missed(lead, notes, now):
     upsert_task(lid, task_text, BADRI, today_18_msk())
     log(f"  сделка {lid}: пропущенный → Бадри")
     return {"lead_id": lid, "category": "missed"}
+
+
+# ---------------- разбор закрытых человеком задач ----------------
+
+NEXT_STEP_SYSTEM = """Ты — оператор CRM автосервиса «Честный Гараж». Сотрудник выполнил задачу по сделке и закрыл её с комментарием. Реши, какой следующий шаг нужен. Верни СТРОГО один JSON-объект.
+
+Правила:
+- Обращение живое (клиент думает, договорились перезвонить, ждёт ответа) → "action": "task" и конкретная задача со следующим шагом.
+- Клиент уже приехал / машина на сервисе → "action": "status", "new_status": "priehal".
+- Вопрос закрыт (не актуален, сделал у других, не наш профиль, дозвонились и отказался) → "action": "nothing".
+- Задача не должна повторять то, что уже сделано. Текст задачи — с формулировкой следующего шага («Далее: …»). Без эмодзи, по-русски, не длиннее 250 символов.
+
+Формат:
+{"action": "task", "task_text": "Kimi для Бадри|Константина: …", "responsible": "Бадри", "due_hours": 12, "new_status": null, "why": "коротко"}"""
+
+
+def decide_next_step(lead_name, status_id, task_result, last_razbor_text):
+    user = (f"Сделка: «{lead_name}» (этап {status_id}).\n"
+            f"Результат закрытой задачи сотрудника: «{task_result}».\n"
+            f"Последний разбор: {last_razbor_text[:1500] or 'нет'}.\n\n"
+            "Реши следующий шаг.")
+    body = {
+        "model": KIMI_MODEL,
+        "temperature": float(os.environ.get("KIMI_TEMPERATURE", "1")),
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": NEXT_STEP_SYSTEM},
+                     {"role": "user", "content": user}],
+    }
+    resp = http("POST", f"{KIMI_BASE}/v1/chat/completions", token=KIMI_KEY, body=body,
+                tries=2, timeout=120)
+    return json.loads(resp["choices"][0]["message"]["content"])
+
+
+def process_closed_task_loops(now, skip_ids=None):
+    """Задача «Kimi для …», закрытая ЧЕЛОВЕКОМ (updated_by = Бадри/Константин)
+    без последующей открытой Kimi-задачи → анализ результата и создание
+    НОВОЙ задачи (правило владельца 06.11: закрытые не воскрешаем, анализ →
+    новая). Работает в конце прогона, после основного разбора."""
+    skip_ids = skip_ids or set()
+    from_ts = int((now - timedelta(days=2)).timestamp())
+    day_ago = int(now.timestamp()) - 24 * 3600
+    # фильтр статусов в amo у этого токена игнорируется — отбираем сами
+    resp = amo_get(f"/api/v4/leads?filter[pipeline_id][]=11282498"
+                   f"&filter[updated_at][from]={from_ts}&limit=200")
+    wanted = {ST_FIRST, ST_TEPLY, ST_PRIEDET}
+    leads = [l for l in embedded(resp, "leads")
+             if l.get("status_id") in wanted and l["id"] not in skip_ids]
+    handled, candidates = 0, 0
+    for l in leads:
+        lid = l["id"]
+        try:
+            tasks = embedded(amo_get(
+                f"/api/v4/tasks?filter[entity_id][]={lid}"
+                f"&filter[entity_type][]=leads&limit=100"), "tasks")
+        except Exception:
+            continue
+        mine = [t for t in tasks if (t.get("text") or "").startswith("Kimi для")]
+        if any(not t.get("is_completed") for t in mine):
+            continue  # открытая Kimi-задача уже есть — всё в порядке
+        closed = [t for t in mine if t.get("is_completed")
+                  and (t.get("updated_at") or 0) >= day_ago
+                  and t.get("updated_by") in (BADRI, KONSTANTIN)]
+        if not closed:
+            continue
+        candidates += 1
+        last = max(closed, key=lambda t: t.get("updated_at") or 0)
+        result_txt = ""
+        try:
+            res = last.get("result")
+            if isinstance(res, list) and res:
+                result_txt = str(res[0].get("text") or "")
+            elif isinstance(res, dict):
+                result_txt = str(res.get("text") or "")
+        except Exception:
+            pass
+        if not result_txt.strip():
+            continue  # закрыта без комментария — не гадаем
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"), "notes")
+            razbors = [(n.get("created_at") or 0, note_text(n)) for n in notes
+                       if note_text(n).startswith("Разбор звонка:")
+                       or note_text(n).startswith("Разбор чата Авито:")]
+            last_razbor = sorted(razbors)[-1][1] if razbors else ""
+            if DRY_RUN:
+                log(f"  DRY_RUN цикл задачи {lid}: результат «{result_txt[:60]}»")
+                handled += 1
+                continue
+            d = decide_next_step(l.get("name") or f"Сделка {lid}", l.get("status_id"),
+                                 result_txt, last_razbor)
+            action = d.get("action")
+            if action == "status" and d.get("new_status") == "priehal":
+                amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_PRIEHAL}])
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"По результату закрытой задачи («{result_txt[:120]}») — клиент приехал, "
+                            f"сделка поднята в «Приехал» (шаг разбора закрытых задач)."}}])
+                handled += 1
+            elif action == "task" and d.get("task_text"):
+                resp_id = KONSTANTIN if d.get("responsible") == "Константин" else BADRI
+                due_h = d.get("due_hours") if isinstance(d.get("due_hours"), (int, float)) else 12
+                due = int(now.timestamp()) + max(1, min(int(due_h), 72)) * 3600
+                upsert_task(lid, str(d["task_text"]).strip(), resp_id, due)
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"Задача закрыта сотрудником («{result_txt[:120]}») → создан следующий шаг "
+                            f"(шаг разбора закрытых задач): {d.get('why') or ''}"}}])
+                handled += 1
+        except Exception as e:
+            log(f"  цикл задачи {lid}: ОШИБКА {e}")
+    log(f"шаг закрытых задач: кандидатов {candidates}, обработано {handled}")
+    return {"candidates": candidates, "handled": handled}
 
 
 # ---------------- main ----------------
@@ -699,8 +842,34 @@ def run():
             notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=250"), "notes")
             texts = [(n, note_text(n)) for n in notes]
 
-            # 1) пропущенные / недозвоны
+            # 0) оболочки телефонии «Исходящий/Входящий звонок <номер>»:
+            # если по номеру уже есть открытая сделка — это дубль обратного
+            # звонка (кейс 79034388810 06.11: менеджер перезвонил клиенту, у
+            # которого уже была сделка «Suzuki Alto — промывка печки»).
+            # Свежие расшифровки переносим в основную сделку, оболочку закрываем.
             lname = (lead.get("name") or "").lower()
+            if re.match(r"^(исходящий|входящий) звонок", lname):
+                phone = extract_phone(lead.get("name") or "")
+                dup = find_open_lead_by_phone(phone) if phone else None
+                if dup and dup != lid:
+                    fresh_trans = [note_text(n) for n in notes
+                                   if "расшифровка" in note_text(n).lower()]
+                    if not DRY_RUN:
+                        for ft in fresh_trans:
+                            amo("POST", f"/api/v4/leads/{dup}/notes", [{"note_type": "common",
+                                "params": {"text": f"Перенос расшифровки из дубля {lid} "
+                                                   f"(тот же номер {phone}):\n{ft[:3000]}"}}])
+                        amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
+                                                        "loss_reason_id": LOSS_DUBL}])
+                        amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                            "text": f"Дубль: по номеру {phone} уже есть открытая сделка {dup}. "
+                                    f"Расшифровки перенесены в основную сделку. Закрыто автоматически."}}])
+                        close_my_tasks(lid)
+                    log(f"  сделка {lid}: оболочка звонка {phone} — дубль {dup}, закрыто")
+                    processed.append({"lead_id": lid, "category": "call-shell-dup", "dup_of": dup})
+                    continue
+
+            # 1) пропущенные / недозвоны
             if lname.startswith("пропущенный звонок") or "недозвон" in lname:
                 # Правило владельца 06.11: 3 попытки дозвона без ответа →
                 # закрываем «не реализовано» с причиной «Не дозвонились».
@@ -777,6 +946,12 @@ def run():
             log(f"  сделка {lid}: ОШИБКА {e}")
             errors.append({"lead_id": lid, "error": str(e)[:300]})
 
+    # Правило владельца 06.11: закрытая человеком задача НЕ воскрешается —
+    # её результат анализируется и создаётся НОВАЯ задача. Кейс Audi Q5:
+    # разбор обновил ещё открытую старую задачу, Бадри её закрыл — и больше
+    # ничто не ставило следующий шаг.
+    closed_loop = process_closed_task_loops(now, skip_ids={p.get("lead_id") for p in processed})
+
     summary = {
         "run": now.strftime("%d.%m.%Y %H:%M"),
         "dry_run": DRY_RUN,
@@ -786,11 +961,13 @@ def run():
         "processed": len(processed),
         "skipped": len(skipped),
         "errors": len(errors),
+        "closed_task_loops": closed_loop,
         "details": processed,
         "skipped_details": skipped,
         "error_details": errors,
     }
-    log(f"=== Итог: разобрано {len(processed)}, отложено {len(skipped)}, ошибок {len(errors)} ===")
+    log(f"=== Итог: разобрано {len(processed)}, отложено {len(skipped)}, ошибок {len(errors)}, "
+        f"закрытые задачи → новый шаг: {closed_loop.get('handled', 0)} ===")
     return summary
 
 

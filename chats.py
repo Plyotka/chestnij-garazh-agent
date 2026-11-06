@@ -109,6 +109,21 @@ SCHED_RE = re.compile(
     r"сегодня|завтра|послезавтра|суббот|воскресен|понедельник|вторник|среду|"
     r"четверг|пятницу|\b\d{1,2}[./ ]\d{1,2}\b|приеду|подъеду|заеду|привезу|"
     r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}", re.IGNORECASE)
+# VIN: 17 латинских букв/цифр подряд (клиенты часто пишут с пробелами — сжимаем)
+VIN_RUN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
+def has_vin(text):
+    compact = re.sub(r"[^A-Za-z0-9]", "", text or "").upper()
+    return bool(VIN_RUN_RE.search(compact))
+# клиент спрашивает цену/стоимость — перед шаблонами проверяем, что на вопрос
+# уже ответили по существу (кейс Евгений/Даниил 06.11: ушёл «оставьте номер»,
+# хотя клиент ждал цену)
+PRICE_ASK_RE = re.compile(
+    r"сколько стоит|сколько будет|во сколько|стоимост|цена|цену|цене|почём|"
+    r"почем|дешевле|дорого|прайс|за сколько|на сколько", re.IGNORECASE)
+def price_answered(text):
+    # ответ по существу = есть сумма (трёхзначное+ число) в ответе сервиса
+    return bool(re.search(r"\d[\d\s]{2,}\s*(руб|₽|т\.?р|тыс|тысяч)?", text or "")
+                and re.search(r"\d{3,}", text or ""))
 FUP_SILENCE_FIRST = 20   # ч тишины после нашего ответа → первый дожим
 FUP_GAP = 20             # минимум ч между любыми отправками клиенту
 LOSS_PROPALA = 24393498  # Пропала потребность
@@ -130,6 +145,8 @@ SYSTEM = """Ты — оператор сделок автосервиса «Че
 - said_will_come: true, если клиент сказал, что приедет (даже без даты); иначе false
 - next_step: одно из "when" (интерес есть, время приезда неясно → уточнить когда приедет), "phone" (готов приехать → запросить телефон), "none" (писать не надо)
 - summary: одна фраза итога для внутренней заметки
+
+ВАЖНО ПРО next_step: "when"/"phone" ставь ТОЛЬКО если клиенту уже ответили по существу его последнего вопроса. Если клиент ждёт цену/расчёт/ответа по сути (особенно его последняя реплика — вопрос «сколько стоит/стоимость?», а сервис на него не ответил) — ставь "none": шаблон про телефон/время перед ответом на вопрос отправлять нельзя.
 
 Формат: {"interest": true, "reason": null, "car": "…", "request": "…", "client_has_phone": false, "phone": null, "said_will_come": false, "next_step": "when", "summary": "…"}"""
 
@@ -283,7 +300,10 @@ def send_pending_templates(tok):
         return 0
     sent_n = 0
     pat = re.compile(r"chat_id=(\S+?): «(.+?)»")
-    for l in embedded(leads, "leads"):
+    # фильтр статусов в amo у этого токена игнорируется — отбираем сами,
+    # иначе дожим ходит по закрытым сделкам и шлёт клиентам лишнее
+    wanted = {ST_FIRST, ST_TEPLY, ST_PRIEDET}
+    for l in [x for x in embedded(leads, "leads") if x.get("status_id") in wanted]:
         tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
         if TAG_CHAT not in tags:
             continue
@@ -342,6 +362,10 @@ def followup_engine(tok):
                     f"&filter[statuses][]={ST_FIRST}&filter[statuses][]={ST_TEPLY}"
                     f"&filter[statuses][]={ST_PRIEDET}"
                     f"&filter[updated_at][from]={from_ts}&limit=250&with=tasks")
+    # фильтр статусов в amo у этого токена игнорируется — отбираем сами,
+    # иначе движок дожима лезет в закрытые сделки и пишет их клиентам
+    wanted = {ST_FIRST, ST_TEPLY, ST_PRIEDET}
+    lead_rows_all = [l for l in embedded(leads, "leads") if l.get("status_id") in wanted]
     done = {"confirm": 0, "actual": 0, "soft": 0, "newdate": 0, "bye": 0,
             "closed": 0, "dup": 0, "refusal": 0,
             "sam_naberet": 0, "human": 0, "manual": 0, "skip": 0}
@@ -379,9 +403,9 @@ def followup_engine(tok):
     def open_tasks(l):
         return [t for t in embedded(l, "tasks") if not t.get("is_completed")]
 
-    def add_task(lead_id, text, till_ts):
+    def add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
         amo("POST", "/api/v4/tasks", [{
-            "text": text, "responsible_user_id": KONSTANTIN,
+            "text": text, "responsible_user_id": responsible,
             "complete_till": int(till_ts), "entity_id": lead_id,
             "entity_type": "leads"}])
 
@@ -389,7 +413,7 @@ def followup_engine(tok):
     # (кейс Данил 06.11: Авито продублировал заявку, контур создал вторую
     # сделку на следующем прогоне — внутрипрогонный антидубль не сработал)
     lead_rows = []
-    for l in embedded(leads, "leads"):
+    for l in lead_rows_all:
         tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
         if TAG_CHAT not in tags:
             continue
@@ -509,6 +533,17 @@ def followup_engine(tok):
                                f"Клиент сам закрыл вопрос: «{last_client[:120]}» "
                                f"— сделка закрыта автоматически (правило владельца 06.11).")
                     continue
+                # прислан VIN → считаем стоимость (правило владельца 06.11:
+                # «прислали VIN — задача Бадри посчитать стоимость», кейс Юлиана)
+                if has_vin(last_client):
+                    if not tasks:
+                        add_task(lid,
+                                 "Kimi для Бадри: посчитать стоимость по VIN из чата Авито "
+                                 f"({(l.get('name') or 'сделка')[:60]}). Далее: назвать цену "
+                                 "в чате → уточнить время приезда → запросить телефон",
+                                 next_9_msk(), BADRI)
+                        done["human"] += 1
+                    continue
                 if SAM_NABERET_RE.search(last_client):
                     due = last_in + 4 * 86400
                     amo("POST", f"/api/v4/leads/{lid}/notes",
@@ -518,8 +553,10 @@ def followup_engine(tok):
                     if not tasks:
                         add_task(lid,
                                  "Kimi для Константина: написать клиенту "
-                                 "(обещал сам набрать, прошло 4 дня) — "
-                                 "мягкий возврат в диалог", due)
+                                 f"({(l.get('name') or 'сделка')[:50]}; обещал сам набрать, "
+                                 "прошло 4 дня) — мягкий возврат в диалог. Далее: молчит "
+                                 "сутки после возврата → «видим, что вопрос не актуален» "
+                                 "и закрытие", due)
                     done["sam_naberet"] += 1
                     continue
                 if "перенес" in last_client.lower() or "не получится" in \
@@ -536,17 +573,20 @@ def followup_engine(tok):
                              "status_id": ST_PRIEDET,
                              "responsible_user_id": KONSTANTIN}])
                         d = (now + timedelta(days=1)).date()
-                        add_task(lid, "Kimi для Константина: за день до "
-                                 "приезда написать «всё получается? "
-                                 "Приедете?»",
+                        add_task(lid, "Kimi для Константина: за день до приезда написать "
+                                 "«всё получается? Приедете?» "
+                                 f"({(l.get('name') or 'сделка')[:50]}). Далее: подтвердил → "
+                                 "«Приехал» по факту; перенос → новая дата + задача",
                                  datetime(d.year, d.month, d.day, 10, 0,
                                           tzinfo=MSK).timestamp())
                     continue
                 # вопрос по сути — нужен человек
                 if not tasks:
                     add_task(lid,
-                             "Kimi для Константина: Ответить в чате Авито — "
-                             "клиент ждёт ответа по сути",
+                             "Kimi для Константина: Ответить в чате Авито — клиент ждёт "
+                             f"ответа по сути ({(l.get('name') or 'сделка')[:50]}). "
+                             "Далее: ответили → уточнить время приезда → «Приедет»; "
+                             "вопрос про цену — назвать цену, не запрашивать телефон раньше",
                              nowts + 3 * 3600)
                     done["human"] += 1
                 continue
@@ -554,8 +594,10 @@ def followup_engine(tok):
             silence = nowts - max(last_out, last_sent_ts)
             if n_sent >= 2 and silence >= 96 * 3600:
                 if not tasks:
-                    add_task(lid, "Kimi для Константина: дожать сделку "
-                             "вручную — 2 автокасания не дали ответа",
+                    add_task(lid, "Kimi для Константина: дожать сделку вручную — "
+                             f"2 автокасания не дали ответа ({(l.get('name') or 'сделка')[:50]}). "
+                             "Далее: нет ответа и после ручного дожима → «видим, что вопрос "
+                             "не актуален» и закрытие",
                              nowts + 86400)
                     done["manual"] += 1
                 continue
@@ -563,8 +605,10 @@ def followup_engine(tok):
                 send(lid, cid, T_ACTUAL, "actual")
             elif n_sent >= 1 and silence >= 72 * 3600:
                 if not tasks:
-                    add_task(lid, "Kimi для Константина: дожать сделку "
-                             "вручную — автокасания не дали ответа",
+                    add_task(lid, "Kimi для Константина: дожать сделку вручную — "
+                             f"автокасания не дали ответа ({(l.get('name') or 'сделка')[:50]}). "
+                             "Далее: нет ответа и после ручного дожима → «видим, что вопрос "
+                             "не актуален» и закрытие",
                              nowts + 86400)
                     done["manual"] += 1
             else:
@@ -744,11 +788,17 @@ def run():
                 if r.get("said_will_come") or phone:
                     patch["status_id"] = ST_PRIEDET
                     patch["responsible_user_id"] = KONSTANTIN
-                    tasks.append(("Kimi для Константина: Приехал?", KONSTANTIN, tomorrow_10_msk()))
+                    tasks.append(("Kimi для Константина: Приехал? {lead}. Далее: подтвердил "
+                                  "приезд → «Приехал»; просит перенос → уточнить новую дату "
+                                  "и задачу за день".format(lead=lead_name),
+                                  KONSTANTIN, tomorrow_10_msk()))
                 else:
                     patch["status_id"] = ST_TEPLY
                     patch["responsible_user_id"] = KONSTANTIN
-                    tasks.append(("Kimi для Константина: Когда приедет?", KONSTANTIN, tomorrow_10_msk()))
+                    tasks.append(("Kimi для Константина: Когда приедет? {lead}. Далее: назвал "
+                                  "дату → «Приедет» + задача за день; молчит → дожим по схеме "
+                                  "(«актуален?» → прощание и закрытие)".format(lead=lead_name),
+                                  KONSTANTIN, tomorrow_10_msk()))
 
             amo("PATCH", "/api/v4/leads", [patch])
 
@@ -775,6 +825,26 @@ def run():
                     tpl = T_PHONE
                 elif r.get("next_step") == "when":
                     tpl = T_WHEN
+                # страховка (кейсы Евгений/Даниил 06.11): если последняя реплика
+                # клиента — вопрос о цене/стоимости, а сервис на него не ответил —
+                # шаблон про телефон/время не отправляем (нелогично). Оставляем
+                # диалог человеку: контрольной задачей будет ответ по существу.
+                if tpl:
+                    client_last_msg = next((msg_text(m) for m in reversed(msgs)
+                                            if m.get("direction") == "in"), "")
+                    our_last_msg = next((msg_text(m) for m in reversed(msgs)
+                                         if m.get("direction") == "out"), "")
+                    if (client_last_msg and PRICE_ASK_RE.search(client_last_msg)
+                            and not price_answered(our_last_msg)):
+                        tpl = None
+                        note += ("\nШаблон НЕ отправлен: клиент ждёт ответа по существу "
+                                 f"(«{client_last_msg[:80]}») — сначала цена/расчёт, "
+                                 "потом телефон/время. Задача контрольная заменена.")
+                        tasks = [("Kimi для Константина: ответить по существу в чате "
+                                  f"Авито — клиент {cname} ждёт цену/расчёт "
+                                  f"(запрос: {request or '—'}). Далее: назвать цену → "
+                                  "уточнить время приезда → запросить телефон.",
+                                  KONSTANTIN, tomorrow_10_msk())]
                 if tpl:
                     if NO_SEND:
                         pending = (cid, tpl)
