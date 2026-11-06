@@ -48,6 +48,8 @@ PHONE_FIELD = 1133163      # поле «Телефон» в контактах (
 PHONE_RE = re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
 ST_CLOSED = 143            # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
+LOSS_NE_DOZVON = 24853446  # Не дозвонились
+LOSS_DUBL = 24765102       # Дубль
 TAG_CALL = "Звонок"  # тег сделок звонкового контура
 
 STAGE_RANK = {ST_NERAZOB: 0, ST_FIRST: 1, ST_TEPLY: 2, ST_PRIEDET: 3, ST_PRIEHAL: 4}
@@ -155,18 +157,27 @@ def classify(transcript, current_name=""):
 
 def today_18_msk():
     """Дедлайн 'к концу рабочего дня'. После 18:00 — следующее рабочее утро (10:00),
-    чтобы ночные прогоны не ставили уже просроченные задачи."""
+    чтобы ночные прогоны не ставили уже просроченные задачи.
+    РЕГЛАМЕНТ (владелец 06.11): звонки только в будни — если дедлайн выпал на
+    субботу/воскресенье, переносим на понедельник 10:00."""
     now = datetime.now(MSK)
     d = now.date()
     ts = datetime(d.year, d.month, d.day, 18, 0, tzinfo=MSK)
     if now > ts:
         ts += timedelta(days=1)
         ts = ts.replace(hour=10, minute=0)
+    while ts.weekday() >= 5:  # 5=суббота, 6=воскресенье
+        ts += timedelta(days=1)
+        ts = ts.replace(hour=10, minute=0)
     return int(ts.timestamp())
 
 
 def tomorrow_10_msk():
+    """10:00 следующего РАБОЧЕГО дня (пн–пт) — субботу и воскресенье пропускаем
+    (регламент владельца 06.11: в выходные не звоним)."""
     d = datetime.now(MSK).date() + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
     return int(datetime(d.year, d.month, d.day, 10, 0, tzinfo=MSK).timestamp())
 
 
@@ -586,19 +597,42 @@ def apply_result(lead, r, now, phone_guess=None):
 
 
 def process_missed(lead, notes, now):
-    """Пропущенные без разбора → Бадри + задача + маркер. Без LLM."""
+    """Пропущенные без разбора → Бадри + задача + маркер. Без LLM.
+    Если номер уже есть в базе с именем контакта — подписываем сделку по имени
+    контакта и линкуем его (кейс 79281767967 06.11: «Пропущенный звонок +N»,
+    хотя контакт известен)."""
     lid = lead["id"]
     name = lead.get("name") or ""
     if any("Пропущенный обработан" in note_text(n) for n in notes):
         return None
     phone = "".join(ch for ch in name.split("Звонок", 1)[-1] if ch.isdigit() or ch == "+")
+    patch = {}
+    if phone:
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        try:
+            cands = embedded(amo_get(f"/api/v4/contacts?query={digits}&limit=10"),
+                             "contacts")
+            named = [c for c in cands
+                     if (c.get("name") or "").strip()
+                     and not re.match(r"^[+\d\s()\-]+$", c["name"].strip())
+                     and not c["name"].startswith(("Пропущенный", "Входящий",
+                                                   "Исходящий", "СЛУЖЕБНЫЙ"))]
+            if named:
+                cname = named[0]["name"].strip()
+                patch["name"] = f"{cname} — пропущенный ({phone})"
+                amo("POST", f"/api/v4/leads/{lid}/links",
+                    [{"to_entity_id": named[0]["id"],
+                      "to_entity_type": "contacts"}])
+                log(f"  сделка {lid}: номер известен — контакт «{cname}»")
+        except Exception:
+            pass
     task_text = f"Kimi для Бадри: Перезвонить/актуализировать по пропущенному: {phone or 'телефон в карточке'}"
     marker = f"Пропущенный обработан: {now.strftime('%d.%m.%Y')}"
     if DRY_RUN:
         log(f"  DRY_RUN: пропущенный {lid}, задача={task_text!r}")
         return {"lead_id": lid, "category": "missed", "dry": True}
-    patch = {"id": lid, "responsible_user_id": BADRI,
-             "_embedded": {"tags": [{"name": TAG_CALL}]}}
+    patch.update({"id": lid, "responsible_user_id": BADRI,
+                  "_embedded": {"tags": [{"name": TAG_CALL}]}})
     if lead.get("status_id") == ST_NERAZOB:
         patch["status_id"] = ST_FIRST
     amo("PATCH", "/api/v4/leads", [patch])
@@ -665,8 +699,27 @@ def run():
             notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=250"), "notes")
             texts = [(n, note_text(n)) for n in notes]
 
-            # 1) пропущенные
-            if (lead.get("name") or "").lower().startswith("пропущенный звонок"):
+            # 1) пропущенные / недозвоны
+            lname = (lead.get("name") or "").lower()
+            if lname.startswith("пропущенный звонок") or "недозвон" in lname:
+                # Правило владельца 06.11: 3 попытки дозвона без ответа →
+                # закрываем «не реализовано» с причиной «Не дозвонились».
+                # Разговор считаем состоявшимся при звонке длиннее 20 сек.
+                attempts = [n for n in notes if n.get("note_type") == "call_out"]
+                talked = any(((n.get("params") or {}).get("duration") or 0) > 20
+                             for n in notes
+                             if n.get("note_type") in ("call_in", "call_out"))
+                if len(attempts) >= 3 and not talked:
+                    if not DRY_RUN:
+                        amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
+                                                        "loss_reason_id": LOSS_NE_DOZVON}])
+                        amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                            "text": f"Закрыто автоматически: {len(attempts)} попыток дозвона, "
+                                    f"абонент не отвечает (правило владельца 06.11)."}}])
+                        close_my_tasks(lid)
+                    log(f"  сделка {lid}: {len(attempts)} попыток без ответа → закрыто «не дозвонились»")
+                    processed.append({"lead_id": lid, "category": "no-answer-close"})
+                    continue
                 res = process_missed(lead, notes, now)
                 if res:
                     processed.append(res)

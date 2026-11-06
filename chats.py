@@ -70,19 +70,40 @@ T_PHONE = ("Отлично! Оставьте, пожалуйста, номер �
 # шаги эскалации дожима (решение владельца 06.11): не чаще одного касания
 # в сутки, привязка к словам клиента о приезде/переносе.
 T_ACTUAL = ("Здравствуйте! Подскажите, актуален ещё вопрос? Работаем с 9:00 "
-            "до 20:00, в субботу до 17:00 — подберём удобное время.")
+            "до 19:00, в субботу до 17:00 — подберём удобное время.")
 T_SOFT = ("Здравствуйте! Если вопрос ещё актуален — напишите, подберём время "
           "и посчитаем точно по вашей машине.")
-T_CONFIRM = ("Отлично! Работаем до 20:00 (в субботу до 17:00). К какому часу "
+T_CONFIRM = ("Отлично! Работаем до 19:00 (в субботу до 17:00). К какому часу "
              "планируете? Зафиксирую запись.")
 T_NEWDATE = ("Хорошо, переносим без проблем. На какой день будет удобно? "
              "Подберём время.")
+# финал: дожим проигнорирован ≥ суток → прощаемся и закрываем (владелец 06.11)
+T_BYE = ("Здравствуйте! Видим, что вопрос, скорее всего, уже не актуален — "
+         "закрываем обращение. Если передумаете — напишите, всегда подберём время.")
+T_ADDRESS = ("Наш адрес: Фурмановская улица, 150Б. Работаем с 9:00 до 19:00, "
+             "в субботу до 17:00.")
 # регулярка chat_id в заметках (движок дожима находит чат сделки по ней)
 CHAT_ID_RE = re.compile(r"chat_id=(u2i-[\w~\-]+)")
 # клиент «сам наберёт» → не дожимаем, напоминаем через 4 дня (схема владельца)
 SAM_NABERET_RE = re.compile(
     r"подумаю|подумать|напишу (вам )?позже|сам (наберу|позвоню)|перезвоню|"
     r"свяжусь (с вами|позже)|на следующей неделе", re.IGNORECASE)
+# клиент закрывает вопрос сам → закрываем сделку без сообщений
+CLOSE_RE = re.compile(
+    r"не актуал|неактуал|уже не нужн|уже сделал|сделал в другом месте|"
+    r"в другом месте|выбрал других|у других|передумал|не интересует|отказ", 
+    re.IGNORECASE)
+# финал переписки — отказ сервиса + вежливое подтверждение клиента = НЕ интерес
+# (кейс Данил 06.11: «Таким не занимаемся» → «Понял» — контур кинул в тёплые и
+# написал «когда приедете»)
+REFUSAL_RE = re.compile(
+    r"не занимаемся|таким не|такое не делаем|не делаем|не сделаем|"
+    r"не моем|не моим|не обслуживаем", re.IGNORECASE)
+ACK_RE = re.compile(r"^(по?нял|ясно|спасибо|ок\b|окей|хорошо|ладно|понятно|"
+                    r"хорош|благодарю|да нет|нет спасибо)", re.IGNORECASE)
+# ключи последней отправки, после которых тишина ≥24 ч → T_BYE и закрытие
+BYE_KEYS = ("actual", "soft", "дожим дневного прогона", "дожим актуальности")
+SENT_KEY_RE = re.compile(r"Отправлено клиенту \((.+?)\):")
 # клиент называет день/время приезда → подтверждаем и фиксируем запись
 SCHED_RE = re.compile(
     r"сегодня|завтра|послезавтра|суббот|воскресен|понедельник|вторник|среду|"
@@ -90,12 +111,14 @@ SCHED_RE = re.compile(
     r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}", re.IGNORECASE)
 FUP_SILENCE_FIRST = 20   # ч тишины после нашего ответа → первый дожим
 FUP_GAP = 20             # минимум ч между любыми отправками клиенту
-FUP_GAP_2 = 48           # ч между первым и вторым дожимом
+LOSS_PROPALA = 24393498  # Пропала потребность
+LOSS_DRUGIE = 24393506   # Выбрали других
+LOSS_DUBL = 24765102     # Дубль
 
 SYSTEM = """Ты — оператор сделок автосервиса «Честный Гараж». По переписке чата Авито определи, есть ли у клиента интерес к услуге, и верни СТРОГО один JSON-объект.
 
 ИНТЕРЕС ЕСТЬ, если клиент обсуждает выполнение работы (уточняет цену/сроки/запчасти/приезд) и НЕ отказался. «Дорого, но не отказался», «подумаю», «приеду» — это интерес.
-ИНТЕРЕСА НЕТ, если: клиент отказался; «не делаем такое» (тюнинг, чип и пр. — не наш профиль); клиент пропал после цены и явно ушёл; просьба невозможна.
+ИНТЕРЕСА НЕТ, если: клиент отказался; «не делаем такое» (тюнинг, чип и пр. — не наш профиль); клиент пропал после цены и явно ушёл; просьба невозможна. ВАЖНО: если ПОСЛЕДНЯЯ реплика СЕРВИСА — отказ («не занимаемся», «таким не занимаемся», «не делаем», «полную не делаем»), а клиент лишь вежливо подтвердил («понял», «спасибо», «ок») — интереса НЕТ, даже если вопрос в начале звучал по делу. Смотри на ФИНАЛ переписки, а не на первый вопрос.
 
 ПОЛЯ:
 - interest: true/false
@@ -319,7 +342,8 @@ def followup_engine(tok):
                     f"&filter[statuses][]={ST_FIRST}&filter[statuses][]={ST_TEPLY}"
                     f"&filter[statuses][]={ST_PRIEDET}"
                     f"&filter[updated_at][from]={from_ts}&limit=250&with=tasks")
-    done = {"confirm": 0, "actual": 0, "soft": 0, "newdate": 0,
+    done = {"confirm": 0, "actual": 0, "soft": 0, "newdate": 0, "bye": 0,
+            "closed": 0, "dup": 0, "refusal": 0,
             "sam_naberet": 0, "human": 0, "manual": 0, "skip": 0}
 
     def send(lead_id, cid, tpl, key):
@@ -332,6 +356,26 @@ def followup_engine(tok):
         done[key] = done.get(key, 0) + 1
         log(f"  дожим+ {lead_id}: {key} → chat {cid[:10]}…")
 
+    def close_lead(lead_id, loss_id, why):
+        amo("PATCH", "/api/v4/leads", [{"id": lead_id, "status_id": ST_CLOSED,
+                                       "loss_reason_id": loss_id}])
+        amo("POST", f"/api/v4/leads/{lead_id}/notes",
+            [{"note_type": "common", "params": {"text": why}}])
+        mine = open_tasks_by_id(lead_id)
+        if mine:
+            amo("PATCH", "/api/v4/tasks",
+                [{"id": t, "is_completed": True} for t in mine])
+        done["closed"] += 1
+
+    _task_cache = {}
+    def open_tasks_by_id(lead_id):
+        if lead_id not in _task_cache:
+            _task_cache[lead_id] = [t["id"] for t in embedded(amo_get(
+                f"/api/v4/tasks?filter[entity_id]={lead_id}"
+                f"&filter[entity_type][]=leads&filter[is_completed]=0&limit=100"),
+                "tasks")]
+        return _task_cache[lead_id]
+
     def open_tasks(l):
         return [t for t in embedded(l, "tasks") if not t.get("is_completed")]
 
@@ -341,16 +385,49 @@ def followup_engine(tok):
             "complete_till": int(till_ts), "entity_id": lead_id,
             "entity_type": "leads"}])
 
+    # --- межпрогонный антидубль: одна сделка на один чат Авито ---
+    # (кейс Данил 06.11: Авито продублировал заявку, контур создал вторую
+    # сделку на следующем прогоне — внутрипрогонный антидубль не сработал)
+    lead_rows = []
     for l in embedded(leads, "leads"):
         tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
         if TAG_CHAT not in tags:
             continue
+        lead_rows.append(l)
+    by_cid = {}
+    for l in lead_rows:
         try:
-            notes = embedded(amo_get(f"/api/v4/leads/{l['id']}/notes?limit=100"),
+            notes0 = embedded(amo_get(f"/api/v4/leads/{l['id']}/notes?limit=100"),
+                              "notes")
+        except Exception:
+            continue
+        cid0 = None
+        for n in sorted(notes0, key=lambda x: x.get("created_at") or 0):
+            m = CHAT_ID_RE.search(((n.get("params") or {}).get("text") or ""))
+            if m:
+                cid0 = m.group(1)
+        if cid0:
+            by_cid.setdefault(cid0, []).append((l, notes0))
+    for cid0, rows in by_cid.items():
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda r: r[0].get("created_at") or 0)
+        for l, _notes in rows[1:]:
+            close_lead(l["id"], LOSS_DUBL,
+                       f"Межпрогонный дубль: по чату {cid0} уже есть сделка "
+                       f"{rows[0][0]['id']} («{rows[0][0].get('name', '')[:50]}»). "
+                       f"Авито продублировал заявку — закрыто автоматически.")
+            done["dup"] += 1
+            lead_rows = [r for r in lead_rows if r["id"] != l["id"]]
+
+    for l in lead_rows:
+        lid = l["id"]
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"),
                              "notes")
         except Exception:
             continue
-        cid, last_sent_ts, n_sent = None, 0, 0
+        cid, last_sent_ts, n_sent, last_key = None, 0, 0, None
         sam_due = None
         for n in sorted(notes, key=lambda x: x.get("created_at") or 0):
             t = ((n.get("params") or {}).get("text") or "")
@@ -360,6 +437,8 @@ def followup_engine(tok):
             if "Отправлено клиенту" in t:
                 n_sent += 1
                 last_sent_ts = max(last_sent_ts, n.get("created_at") or 0)
+                km = SENT_KEY_RE.search(t)
+                last_key = km.group(1) if km else last_key
             if "сам наберёт — вернуться" in t:
                 mm = re.search(r"после (\d+)", t)
                 if mm:
@@ -372,7 +451,7 @@ def followup_engine(tok):
                                f"{AVITO_UID}/chats/{cid}/messages/?limit=50",
                         token=tok).get("messages") or []
         except Exception as e:
-            log(f"  дожим+ {l['id']}: не прочитан чат ({e})")
+            log(f"  дожим+ {lid}: не прочитан чат ({e})")
             continue
         ins = [m for m in msgs if m.get("direction") == "in"
                and not msg_text(m).startswith("[Системное")]
@@ -384,27 +463,60 @@ def followup_engine(tok):
         nowts = int(now.timestamp())
         tasks = open_tasks(l)
         try:
+            # финал — отказ сервиса («таким не занимаемся») + «понял» клиента:
+            # сделка живёт по ошибке — закрываем (кейс Данил 06.11)
+            our_last2 = [msg_text(m) for m in outs][-2:]
+            client_last_txt = next((msg_text(m) for m in reversed(msgs)
+                                    if m.get("direction") == "in"), "")
+            if (last_out > last_in and client_last_txt
+                    and any(REFUSAL_RE.search(t or "") for t in our_last2)
+                    and ACK_RE.search(client_last_txt)):
+                close_lead(lid, LOSS_NE_NASH_PROFIL,
+                           "Автозакрытие движка дожима: финал переписки — отказ "
+                           "сервиса («не занимаемся/не делаем»), клиент подтвердил "
+                           "вежливо. Сделка оказалась в воронке по ошибке.")
+                done["refusal"] += 1
+                continue
             if sam_due and nowts < sam_due:
                 continue  # клиент просил сам набрать — ждём срока
+            # дожим проигнорирован ≥ суток → прощаемся и закрываем (владелец 06.11)
+            if (last_key and any(k in last_key for k in BYE_KEYS)
+                    and last_in < last_sent_ts
+                    and nowts - last_sent_ts >= 24 * 3600):
+                send(lid, cid, T_BYE, "bye")
+                close_lead(lid, LOSS_PROPALA,
+                           "Дожим не получил ответа более суток — отправлено "
+                           "прощальное сообщение, сделка закрыта «Пропала "
+                           "потребность» (схема владельца 06.11).")
+                continue
             # антиспам-зазор: после любой нашей отправки ≥FUP_GAP ч тишины
             if n_sent > 0 and nowts - last_sent_ts < FUP_GAP * 3600:
                 continue
             if sam_due and nowts >= sam_due:
-                send(l["id"], cid, T_SOFT, "soft")
+                send(lid, cid, T_SOFT, "soft")
                 continue
             if last_in > last_out:  # клиент ждёт нашего ответа
                 if nowts - last_in < 2 * 3600:
                     continue
                 last_client = next(msg_text(m) for m in reversed(msgs)
                                    if m.get("direction") == "in")
+                # клиент сам закрыл вопрос → закрываем сделку, не пишем ему
+                if CLOSE_RE.search(last_client):
+                    loss = (LOSS_DRUGIE if ("друг" in last_client.lower()
+                                            or "у других" in last_client.lower())
+                            else LOSS_PROPALA)
+                    close_lead(lid, loss,
+                               f"Клиент сам закрыл вопрос: «{last_client[:120]}» "
+                               f"— сделка закрыта автоматически (правило владельца 06.11).")
+                    continue
                 if SAM_NABERET_RE.search(last_client):
                     due = last_in + 4 * 86400
-                    amo("POST", f"/api/v4/leads/{l['id']}/notes",
+                    amo("POST", f"/api/v4/leads/{lid}/notes",
                         [{"note_type": "common", "params": {"text":
                             f"Клиент «сам наберёт — вернуться» после {due} "
                             f"(4 дня, схема владельца). Дожим до срока не шлём."}}])
                     if not tasks:
-                        add_task(l["id"],
+                        add_task(lid,
                                  "Kimi для Константина: написать клиенту "
                                  "(обещал сам набрать, прошло 4 дня) — "
                                  "мягкий возврат в диалог", due)
@@ -412,19 +524,19 @@ def followup_engine(tok):
                     continue
                 if "перенес" in last_client.lower() or "не получится" in \
                         last_client.lower() or "переношу" in last_client.lower():
-                    send(l["id"], cid, T_NEWDATE, "newdate")
+                    send(lid, cid, T_NEWDATE, "newdate")
                     continue
                 if SCHED_RE.search(last_client):
                     if not any("Отправлено клиенту" in ((n.get("params") or {})
                                .get("text") or "") and
                                (n.get("created_at") or 0) > last_in
                                for n in notes):
-                        send(l["id"], cid, T_CONFIRM, "confirm")
-                        amo("PATCH", "/api/v4/leads", [{"id": l["id"],
+                        send(lid, cid, T_CONFIRM, "confirm")
+                        amo("PATCH", "/api/v4/leads", [{"id": lid,
                              "status_id": ST_PRIEDET,
                              "responsible_user_id": KONSTANTIN}])
                         d = (now + timedelta(days=1)).date()
-                        add_task(l["id"], "Kimi для Константина: за день до "
+                        add_task(lid, "Kimi для Константина: за день до "
                                  "приезда написать «всё получается? "
                                  "Приедете?»",
                                  datetime(d.year, d.month, d.day, 10, 0,
@@ -432,7 +544,7 @@ def followup_engine(tok):
                     continue
                 # вопрос по сути — нужен человек
                 if not tasks:
-                    add_task(l["id"],
+                    add_task(lid,
                              "Kimi для Константина: Ответить в чате Авито — "
                              "клиент ждёт ответа по сути",
                              nowts + 3 * 3600)
@@ -442,19 +554,23 @@ def followup_engine(tok):
             silence = nowts - max(last_out, last_sent_ts)
             if n_sent >= 2 and silence >= 96 * 3600:
                 if not tasks:
-                    add_task(l["id"], "Kimi для Константина: дожать сделку "
+                    add_task(lid, "Kimi для Константина: дожать сделку "
                              "вручную — 2 автокасания не дали ответа",
                              nowts + 86400)
                     done["manual"] += 1
                 continue
             if n_sent == 0 and silence >= FUP_SILENCE_FIRST * 3600:
-                send(l["id"], cid, T_ACTUAL, "actual")
-            elif n_sent == 1 and silence >= FUP_GAP_2 * 3600:
-                send(l["id"], cid, T_SOFT, "soft")
+                send(lid, cid, T_ACTUAL, "actual")
+            elif n_sent >= 1 and silence >= 72 * 3600:
+                if not tasks:
+                    add_task(lid, "Kimi для Константина: дожать сделку "
+                             "вручную — автокасания не дали ответа",
+                             nowts + 86400)
+                    done["manual"] += 1
             else:
                 done["skip"] += 1
         except Exception as e:
-            log(f"  дожим+ {l['id']}: ошибка ({e})")
+            log(f"  дожим+ {lid}: ошибка ({e})")
     log(f"дожим+ движок: {json.dumps(done, ensure_ascii=False)}")
     return done
 
@@ -578,6 +694,19 @@ def run():
             item_title = (((chat.get("context") or {}).get("value") or {}).get("title")) or "услуга сервиса"
             r = classify(transcript, cname, item_title)
             interest = bool(r.get("interest"))
+            # детерминированная страховка (кейс Данил 06.11): финал — отказ
+            # сервиса + вежливое «понял» клиента → интереса нет вне зависимости
+            # от того, что решил LLM по первому вопросу
+            our_last = [msg_text(m) for m in msgs
+                        if m.get("direction") == "out"][-2:]
+            client_last = next((msg_text(m) for m in reversed(msgs)
+                                if m.get("direction") == "in"), "")
+            if (interest and client_last
+                    and any(REFUSAL_RE.search(t or "") for t in our_last)
+                    and ACK_RE.search(client_last)):
+                interest = False
+                r["summary"] = ((r.get("summary") or "")
+                                + " [переопределено: финал — отказ сервиса]")
             request = (r.get("request") or "").strip()
             lead_name = f"{cname} — {request[:60]}" if request else f"Авито — {cname}"
             phone = norm_phone(r.get("phone") or "")
