@@ -73,8 +73,8 @@ T_ACTUAL = ("Здравствуйте! Подскажите, актуален е
             "до 19:00, в субботу до 17:00 — подберём удобное время.")
 T_SOFT = ("Здравствуйте! Если вопрос ещё актуален — напишите, подберём время "
           "и посчитаем точно по вашей машине.")
-T_CONFIRM = ("Отлично! Работаем до 19:00 (в субботу до 17:00). К какому часу "
-             "планируете? Зафиксирую запись.")
+T_CONFIRM = ("Подскажите, к какому часу планируете? Работаем до 19:00 "
+             "(в субботу до 17:00). Зафиксирую запись.")
 T_NEWDATE = ("Хорошо, переносим без проблем. На какой день будет удобно? "
              "Подберём время.")
 # финал: дожим проигнорирован ≥ суток → прощаемся и закрываем (владелец 06.11)
@@ -119,6 +119,13 @@ SCHED_RE = re.compile(
     r"сегодня|завтра|послезавтра|суббот|воскресен|понедельник|вторник|среду|"
     r"четверг|пятницу|\b\d{1,2}[./ ]\d{1,2}\b|приеду|подъеду|заеду|привезу|"
     r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}", re.IGNORECASE)
+# клиент «вот-вот приедет» → никаких дожимов, только задача «Приехал?»
+# (кейс Никита-форсунки 07.11: «щас ищу кто прикурит», а контур слал
+# «актуален?» каждый день — владелец: «ждёт пока прикурит, а мы долбим»)
+PATIENT_RE = re.compile(
+    r"прикур|выехал|уже еду|в пути|доезжаю|скоро буду|через \d+ минут|"
+    r"сейчас подъеду|сейчас приеду|позже приеду|подъеду позже|минут через|"
+    r"по пути|собираюсь выезжать", re.IGNORECASE)
 # VIN: 17 латинских букв/цифр подряд (клиенты часто пишут с пробелами — сжимаем)
 VIN_RUN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
 def has_vin(text):
@@ -417,22 +424,25 @@ def followup_engine(tok):
         mine = open_tasks_by_id(lead_id)
         if mine:
             amo("PATCH", "/api/v4/tasks",
-                [{"id": t, "is_completed": True} for t in mine])
+                [{"id": t["id"], "is_completed": True} for t in mine])
+            _task_cache.pop(lead_id, None)
         done["closed"] += 1
 
     _task_cache = {}
     def open_tasks_by_id(lead_id):
+        """Открытые задачи сделки ПО API (amo не встраивает tasks в lead)."""
         if lead_id not in _task_cache:
-            _task_cache[lead_id] = [t["id"] for t in embedded(amo_get(
+            _task_cache[lead_id] = embedded(amo_get(
                 f"/api/v4/tasks?filter[entity_id]={lead_id}"
                 f"&filter[entity_type][]=leads&filter[is_completed]=0&limit=100"),
-                "tasks")]
+                "tasks")
         return _task_cache[lead_id]
 
     def open_tasks(l):
         return [t for t in embedded(l, "tasks") if not t.get("is_completed")]
 
     def add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
+        _task_cache.pop(lead_id, None)  # кеш открытых задач протух
         amo("POST", "/api/v4/tasks", [{
             "text": text, "responsible_user_id": responsible,
             "complete_till": int(till_ts), "entity_id": lead_id,
@@ -519,12 +529,17 @@ def followup_engine(tok):
         last_in = max((m.get("created") or 0) for m in ins) if ins else 0
         last_out = max((m.get("created") or 0) for m in outs) if outs else 0
         nowts = int(now.timestamp())
-        tasks = open_tasks(l)
+        # open_tasks(l) НЕ работает: amoCRM не встраивает tasks в lead
+        # (with=tasks игнорируется) — проверяем открытые задачи через API
+        tasks = open_tasks_by_id(lid)
         try:
             # финал — отказ сервиса («таким не занимаемся») + «понял» клиента:
             # сделка живёт по ошибке — закрываем (кейс Данил 06.11)
-            our_last2 = [msg_text(m) for m in outs][-2:]
-            client_last_txt = next((msg_text(m) for m in reversed(msgs)
+            # ВАЖНО: messenger/v3 отдаёт сообщения ОТ НОВЫХ К СТАРЫМ —
+            # берём [:2]/первое, а не [-2:]/reversed (кейс Юлиана 07.11:
+            # движок смотрел САМОЕ ПЕРВОЕ сообщение и слал confirm по «вечеру»)
+            our_last2 = [msg_text(m) for m in outs][:2]
+            client_last_txt = next((msg_text(m) for m in msgs
                                     if m.get("direction") == "in"), "")
             if (last_out > last_in and client_last_txt
                     and any(REFUSAL_RE.search(t or "") for t in our_last2)
@@ -556,7 +571,7 @@ def followup_engine(tok):
             if last_in > last_out:  # клиент ждёт нашего ответа
                 if nowts - last_in < 2 * 3600:
                     continue
-                last_client = next(msg_text(m) for m in reversed(msgs)
+                last_client = next(msg_text(m) for m in msgs
                                    if m.get("direction") == "in")
                 # клиент сам закрыл вопрос → закрываем сделку, не пишем ему
                 if CLOSE_RE.search(last_client):
@@ -576,6 +591,24 @@ def followup_engine(tok):
                                  f"({(l.get('name') or 'сделка')[:60]}). Далее: назвать цену "
                                  "в чате → уточнить время приезда → запросить телефон",
                                  next_9_msk(), BADRI)
+                        done["human"] += 1
+                    continue
+                # клиент «вот-вот приедет» → не пишем ничего, вечером «Приехал?»
+                if PATIENT_RE.search(last_client):
+                    if not tasks:
+                        eve = now.replace(hour=19, minute=0, second=0,
+                                          microsecond=0)
+                        if now >= eve:
+                            eve += timedelta(days=1)
+                        add_task(lid, "Kimi для Константина: клиент обещал "
+                                 "подъехать (ждёт/в пути) — написать «всё "
+                                 f"получается? Приедете?» ({(l.get('name') or 'сделка')[:50]}). "
+                                 "Далее: подтвердил → «Приехал»; перенос → новая дата.",
+                                 int(eve.timestamp()))
+                        amo("POST", f"/api/v4/leads/{lid}/notes",
+                            [{"note_type": "common", "params": {"text":
+                                "Клиент «вот-вот приедёт» (прикурит/в пути) — "
+                                "автодожимы запрещены, задача «Приехал?» на вечер."}}])
                         done["human"] += 1
                     continue
                 if SAM_NABERET_RE.search(last_client):
@@ -598,6 +631,15 @@ def followup_engine(tok):
                     send(lid, cid, T_NEWDATE, "newdate")
                     continue
                 if SCHED_RE.search(last_client):
+                    # клиент ждёт просчёт → не приглашаем, пока цена не названа
+                    if any("посчитать стоимость" in (t.get("text") or "")
+                           for t in tasks):
+                        amo("POST", f"/api/v4/leads/{lid}/notes",
+                            [{"note_type": "common", "params": {"text":
+                                "Клиент назвал время, но ждёт просчёт стоимости "
+                                "(открытая задача на расчёт) — приглашение НЕ "
+                                "отправлено, сначала цена (правило владельца 07.11)."}}])
+                        continue
                     if not any("Отправлено клиенту" in ((n.get("params") or {})
                                .get("text") or "") and
                                (n.get("created_at") or 0) > last_in
@@ -629,7 +671,7 @@ def followup_engine(tok):
             # сервис «подъезжайте»): формально последняя реплика наша, но клиент
             # назвал день/время и сервис подтвердил — сделка должна быть в
             # «Приедет», а не дожиматься «актуален?»
-            last_ins_txt = [msg_text(m) for m in ins][-2:]
+            last_ins_txt = [msg_text(m) for m in ins[:2]]
             joint_in = " ".join(t or "" for t in last_ins_txt)
             if (l.get("status_id") != ST_PRIEDET and last_ins_txt
                     and any(SCHED_RE.search(t or "") for t in last_ins_txt)
@@ -653,6 +695,9 @@ def followup_engine(tok):
                         "Задача — подтвердить запись за день."}}])
                 done["confirm"] += 1
                 continue
+            # клиент «вот-вот приедет» — не долбим вообще (кейс Никита)
+            if PATIENT_RE.search(joint_in):
+                continue
             silence = nowts - max(last_out, last_sent_ts)
             if n_sent >= 2 and silence >= 96 * 3600:
                 if not tasks:
@@ -664,7 +709,13 @@ def followup_engine(tok):
                     done["manual"] += 1
                 continue
             if n_sent == 0 and silence >= FUP_SILENCE_FIRST * 3600:
-                send(lid, cid, T_ACTUAL, "actual")
+                # в «Приедет» «актуален?» не задаём — спрашиваем про перенос
+                # (кейс Никита-форсунки: долбили «актуален?», хотя клиент
+                # собирался приехать — владелец 07.11)
+                if l.get("status_id") == ST_PRIEDET:
+                    send(lid, cid, T_NEWDATE, "newdate")
+                else:
+                    send(lid, cid, T_ACTUAL, "actual")
             elif n_sent >= 1 and silence >= 72 * 3600:
                 if not tasks:
                     add_task(lid, "Kimi для Константина: дожать сделку вручную — "
@@ -787,7 +838,9 @@ def run():
                 continue
 
             parts = []
-            for m in msgs:
+            # messenger/v3 отдаёт сообщения ОТ НОВЫХ К СТАРЫМ — для транскрипта
+            # разворачиваем в хронологию (кейс Юлиана 07.11)
+            for m in reversed(msgs):
                 who = "КЛИЕНТ" if m.get("direction") == "in" else "СЕРВИС"
                 t = msg_text(m)
                 if t:
@@ -804,8 +857,8 @@ def run():
             # сервиса + вежливое «понял» клиента → интереса нет вне зависимости
             # от того, что решил LLM по первому вопросу
             our_last = [msg_text(m) for m in msgs
-                        if m.get("direction") == "out"][-2:]
-            client_last = next((msg_text(m) for m in reversed(msgs)
+                        if m.get("direction") == "out"][:2]
+            client_last = next((msg_text(m) for m in msgs
                                 if m.get("direction") == "in"), "")
             if (interest and client_last
                     and any(REFUSAL_RE.search(t or "") for t in our_last)
@@ -816,7 +869,7 @@ def run():
             # страховка 2 (кейс Игорь 07.11): ПОСЛЕДНЯЯ реплика в чате — отказ
             # сервиса, а клиент после него промолчал → интереса нет: не принимаем
             # в воронку и не дожимаем «актуален?» человека, которому отказали.
-            last_msg = msgs[-1] if msgs else {}
+            last_msg = msgs[0] if msgs else {}  # msgs: новые первые
             if (interest and last_msg.get("direction") == "out"
                     and REFUSAL_RE.search(msg_text(last_msg) or "")):
                 interest = False
@@ -902,9 +955,9 @@ def run():
                 # шаблон про телефон/время не отправляем (нелогично). Оставляем
                 # диалог человеку: контрольной задачей будет ответ по существу.
                 if tpl:
-                    client_last_msg = next((msg_text(m) for m in reversed(msgs)
+                    client_last_msg = next((msg_text(m) for m in msgs
                                             if m.get("direction") == "in"), "")
-                    our_last_msg = next((msg_text(m) for m in reversed(msgs)
+                    our_last_msg = next((msg_text(m) for m in msgs
                                          if m.get("direction") == "out"), "")
                     if (client_last_msg and PRICE_ASK_RE.search(client_last_msg)
                             and not price_answered(our_last_msg)):
