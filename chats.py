@@ -109,6 +109,10 @@ ACK_RE = re.compile(r"^(по?нял|ясно|спасибо|ок\b|окей|хо
                     r"хорош|благодарю|да нет|нет спасибо)", re.IGNORECASE)
 # ключи последней отправки, после которых тишина ≥24 ч → T_BYE и закрытие
 BYE_KEYS = ("actual", "soft", "дожим дневного прогона", "дожим актуальности")
+# шаговые ключи дожима — только они образуют лестницу (T_ACTUAL → T_SOFT → bye);
+# прочие отправки (предложение осмотра и т.п.) лестницу не блокируют
+FUP_KEYS = ("actual", "soft", "confirm", "bye", "newdate",
+            "дожим дневного прогона", "дожим актуальности")
 SENT_KEY_RE = re.compile(r"Отправлено клиенту \((.+?)\):")
 # клиент называет день/время приезда → подтверждаем и фиксируем запись
 SCHED_RE = re.compile(
@@ -465,10 +469,15 @@ def followup_engine(tok):
             if m:
                 cid = m.group(1)
             if "Отправлено клиенту" in t:
-                n_sent += 1
+                # лестница дожима считается только по шаговым ключам; разовые
+                # сообщения (напр. «предложение осмотра», кейс Антон 07.11)
+                # антиспам-зазор держат (last_sent_ts), но лестницу не блокируют
                 last_sent_ts = max(last_sent_ts, n.get("created_at") or 0)
                 km = SENT_KEY_RE.search(t)
-                last_key = km.group(1) if km else last_key
+                key = km.group(1) if km else ""
+                if any(k in key for k in FUP_KEYS):
+                    n_sent += 1
+                    last_key = key
             if "сам наберёт — вернуться" in t:
                 mm = re.search(r"после (\d+)", t)
                 if mm:
