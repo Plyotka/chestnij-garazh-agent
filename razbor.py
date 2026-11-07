@@ -236,13 +236,13 @@ def close_my_tasks(lead_id):
 
 
 def carry_overdue_tasks(now):
-    """ШАГ 0 (правило 28.10, выполняется первым в прогоне): открытые просроченные задачи.
-    Сделка в 142/143 → закрыть задачу; иначе → complete_till сегодня 18:00 мск,
-    а если оно уже прошло — завтра 10:00. Текст, ответственного и связь с сущностью не менять."""
+    """ШАГ 0 (правка 07.11 по просьбе владельца): просроченная задача ВИСИТ красной
+    до конца рабочего дня — перенос на завтра 10:00 мск происходит только в прогонах
+    после 19:00 мск; дневные прогоны просроченные не трогают.
+    Сделка в 142/143 → закрыть задачу (всегда). Текст, ответственного и связь не менять."""
     now_ts = int(now.timestamp())
-    due = today_18_msk()
-    if due <= now_ts:
-        due = tomorrow_10_msk()
+    move_overdue = now.hour >= 19  # мск — now приходит в MSK (run(): datetime.now(MSK))
+    due = tomorrow_10_msk()
 
     moved, closed = [], []
     url = f"{AMO_BASE}/api/v4/tasks?filter[is_completed]=0&filter[complete_till][to]={now_ts}&limit=250"
@@ -264,10 +264,11 @@ def carry_overdue_tasks(now):
                 continue  # задачи вне сделок не трогаем
             if statuses.get(t["entity_id"]) in (ST_SUCCESS, ST_CLOSED):
                 patch_close.append({"id": t["id"], "is_completed": True})
-            else:
+            elif move_overdue:
                 patch_move.append({"id": t["id"], "complete_till": due})
         if DRY_RUN:
-            log(f"  DRY_RUN шаг 0: перенести {len(patch_move)}, закрыть {len(patch_close)}")
+            log(f"  DRY_RUN шаг 0: перенести {len(patch_move)}, закрыть {len(patch_close)}"
+                f"{' (перенос выкл: ещё не 19:00 мск)' if not move_overdue else ''}")
         else:
             if patch_move:
                 amo("PATCH", "/api/v4/tasks", patch_move)
