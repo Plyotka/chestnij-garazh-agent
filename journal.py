@@ -12,6 +12,7 @@ JOURNAL_DRY=true — только печать заметки, без запис
 import json
 import os
 import re
+import time
 import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -20,6 +21,45 @@ MSK = ZoneInfo("Europe/Moscow")
 AMO_BASE = "https://autoservice61.amocrm.ru"
 JOURNAL_LEAD_ID = int(os.environ.get("JOURNAL_LEAD_ID", "0"))
 DRY = os.environ.get("JOURNAL_DRY", "false").lower() == "true"
+
+# P2 (11.11): радар застрявших сделок — открытые «Первичный/Тёплые/Приедет»
+# без движения 3+ суток. Детерминированно, без LLM. Идея из РАЗБОР-ЗАТЫКОВ-10.11
+# (сквозная причина №4: застрявшие находит только глазами владелец).
+ST_OPEN = {88470414: "Первичный", 88470418: "Тёплые", 88470422: "Приедет"}
+STUCK_DAYS = 3
+
+
+def stuck_block(token):
+    """Сводка «застрявших» сделок: без изменений STUCK_DAYS+ суток.
+    Используем filter[updated_at][to] — amo отдаст ТОЛЬКО stale-сделки,
+    страниц будет немного. Фильтр статусов у токена игнорируется (известная
+    ловушка) — отбираем статусы сами."""
+    try:
+        from_ts = int(time.time()) - STUCK_DAYS * 86400
+        req = urllib.request.Request(
+            f"{AMO_BASE}/api/v4/leads?filter[pipeline_id][]=11282498"
+            f"&filter[updated_at][to]={from_ts}&limit=250",
+            headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            leads = (json.loads(r.read().decode()).get("_embedded") or {}).get("leads") or []
+        rows = []
+        for l in leads:
+            s = l.get("status_id")
+            if s in ST_OPEN:
+                rows.append((l.get("updated_at") or 0, l.get("id"),
+                             (l.get("name") or "").strip(), ST_OPEN[s]))
+        if not rows:
+            return None
+        rows.sort()
+        lines = [f"[РАДАР] застрявшие (без движения {STUCK_DAYS}+ суток): {len(rows)}"]
+        for ts, lid, nm, st in rows[:10]:
+            d = datetime.fromtimestamp(ts, MSK).strftime("%d.%m")
+            lines.append(f"  • {lid} «{nm[:45]}» ({st}, с {d})")
+        if len(rows) > 10:
+            lines.append(f"  • … и ещё {len(rows) - 10}")
+        return lines
+    except Exception as e:
+        return [f"[РАДАР] не удалось построить ({e})"]
 
 
 def extract_summary(path, prefix=None):
@@ -83,6 +123,11 @@ def main():
     rz = extract_summary("razbor.out")
     ch = extract_summary("chats.out", prefix="SUMMARY_JSON:")
 
+    # токен нужен и для радара, и для записи журнала — читаем заранее
+    token = None
+    if not DRY and JOURNAL_LEAD_ID:
+        token = os.environ.get("AMO_TOKEN") or None
+
     parts = [f"Прогон {now.strftime('%d.%m.%Y %H:%M')} мск"]
 
     if rz is None:
@@ -118,12 +163,18 @@ def main():
         elif sk:
             parts += ["  [пропуски]:"] + bullets(sk[:4])
 
+    # P2: радар застрявших — добавляем и в дневные, и в ночные записи
+    # (чтение дешёвое, а ночью карточки как раз «дозревают» без движения)
+    if token:
+        radar = stuck_block(token)
+        if radar:
+            parts += radar
+
     note = "\n".join(parts)
     print(note)
 
-    if DRY or not JOURNAL_LEAD_ID:
+    if DRY or not JOURNAL_LEAD_ID or not token:
         return
-    token = os.environ["AMO_TOKEN"]
     req = urllib.request.Request(
         f"{AMO_BASE}/api/v4/leads/{JOURNAL_LEAD_ID}/notes",
         data=json.dumps([{"note_type": "common", "params": {"text": note}}]).encode(),

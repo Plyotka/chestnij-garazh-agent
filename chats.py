@@ -300,17 +300,39 @@ def norm_phone(raw):
 
 
 def find_chat_for_item(item, by_name):
+    """Подбор чата Авито для заявки лотка.
+
+    F10 (11.11): раньше искали только по users[0].name — но клиент может идти
+    НЕ первым в users (кейс Дмитрий(Рябуха): users[0] — наш профиль, клиент —
+    users[1], чат не находился, заявка голодала в лотке). Теперь: точное имя
+    → любое имо в users → fallback по близости времени среди всех свежих чатов.
+    """
     md = item.get("metadata") or {}
     name = (md.get("from") or "").strip().lower()
     got = md.get("received_at") or 0
     last = md.get("last_message_text") or 0
+    if isinstance(last, str):
+        last = 0  # в метаданных бывает текст, а не таймстамп (затык 11.11)
+
+    def dist(c):
+        d = abs((c.get("created") or 0) - got)
+        if last:
+            d = min(d, abs((c.get("updated") or 0) - last))
+        return d
+
     best, best_d = None, 1e18
     for c in by_name.get(name, []):
-        d = abs((c.get("created") or 0) - got)
-        d = min(d, abs((c.get("updated") or 0) - last))
+        d = dist(c)
         if d < best_d:
             best, best_d = c, d
-    return (best, best_d) if best_d <= 120 else (None, best_d)
+    if best_d <= 120:
+        return best, best_d
+    # имя не совпало ни с одним чатом — ищем ближайший по времени среди всех
+    for c in by_name.get("*", []):
+        d = dist(c)
+        if d < best_d:
+            best, best_d = c, d
+    return (best, best_d) if best_d <= 3600 else (None, best_d)
 
 
 def send_pending_templates(tok):
@@ -870,8 +892,15 @@ def run():
 
     by_name = {}
     for c in fresh:
-        nm = ((c.get("users") or [{}])[0].get("name") or "").strip().lower()
-        by_name.setdefault(nm, []).append(c)
+        # F10: ключи — имена ВСЕХ участников, кроме нашего профиля. Раньше
+        # брался только users[0] — а там может быть сам сервис, а клиент —
+        # users[1] (кейс Дмитрий(Рябуха) 11.11: чат существовал, подбор fails).
+        for u in (c.get("users") or []):
+            nm = (u.get("name") or "").strip().lower()
+            if not nm:
+                continue
+            by_name.setdefault(nm, []).append(c)
+        by_name.setdefault("*", []).append(c)  # fallback-пул для поиска по времени
 
     unsorted = [u for u in embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
                 if "avito" in (u.get("source_name") or "").lower()]
@@ -886,8 +915,13 @@ def run():
     # в лоток; без этой проверки контур создаст по сделке на каждое объявление
     # (кейс Юлианны 05.11: две сделки «Шиномонтаж» с разницей в минуту).
     def chat_uid(c):
+        # F10: users[0] может быть наш профиль, а не клиент (кейс Дмитрий(Рябуха))
+        # — тогда все чаты слипнутся в одного «клиента». Берём первого НЕ нашего.
         try:
-            return c["users"][0].get("id") or None
+            for u in c.get("users") or []:
+                if u.get("id") != AVITO_UID and u.get("id"):
+                    return u.get("id")
+            return None
         except (KeyError, IndexError, TypeError):
             return None
 

@@ -54,6 +54,19 @@ TAG_CALL = "Звонок"  # тег сделок звонкового конту
 
 STAGE_RANK = {ST_NERAZOB: 0, ST_FIRST: 1, ST_TEPLY: 2, ST_PRIEDET: 3, ST_PRIEHAL: 4}
 
+# Войси с ~11.2026 вставляет в тексты расшифровок невидимые символы
+# (zero-width spaces, BOM, word joiner и пр.). Кириллица на месте, но сырые
+# тексты отравляют LLM и ломает детерминированные regex-проверки — чистим
+# перед разбором (в хранимые заметки не лезем, только вход классификатора).
+ZW_RE = re.compile(r"[\u200b\u200c\u200d\u2060\u2063\ufeff\u200e\u200f]")
+
+
+def clean_text(t):
+    if not t:
+        return t or ""
+    t = ZW_RE.sub("", t)
+    return re.sub(r"[\u00a0\u2007\u2009\u202f\u205f]", " ", t)
+
 
 def log(msg):
     print(f"[{datetime.now(MSK).strftime('%d.%m.%Y %H:%M:%S')}] {msg}", flush=True)
@@ -961,7 +974,7 @@ def run():
             fresh_sorted = sorted(fresh, key=lambda n: n.get("created_at", 0))
             parts = []
             for i, n in enumerate(fresh_sorted, 1):
-                txt = note_text(n)
+                txt = clean_text(note_text(n))
                 if txt:
                     parts.append(f"=== ЗВОНОК {i} ===\n{txt}")
             transcript = "\n\n".join(parts)
