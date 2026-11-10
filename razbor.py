@@ -869,7 +869,8 @@ def run():
                 dup = find_open_lead_by_phone(phone) if phone else None
                 if dup and dup != lid:
                     fresh_trans = [note_text(n) for n in notes
-                                   if "расшифровка" in note_text(n).lower()]
+                                   if "расшифровка" in note_text(n).lower()
+                                   or "содержание звонка" in note_text(n).lower()]
                     if not DRY_RUN:
                         for ft in fresh_trans:
                             amo("POST", f"/api/v4/leads/{dup}/notes", [{"note_type": "common",
@@ -881,6 +882,26 @@ def run():
                             "text": f"Дубль: по номеру {phone} уже есть открытая сделка {dup}. "
                                     f"Расшифровки перенесены в основную сделку. Закрыто автоматически."}}])
                         close_my_tasks(lid)
+                        # верификация переноса: заметка должна физически появиться
+                        # в основной сделке (кейс 09.11: POST прошёл без ошибки,
+                        # а заметки в основной сделке не оказалось — она навсегда
+                        # осталась «Пропущенный звонок +N», разбор не запустился)
+                        try:
+                            dup_notes = embedded(amo_get(
+                                f"/api/v4/leads/{dup}/notes?limit=250"), "notes")
+                            missing = [ft for ft in fresh_trans
+                                       if not any(ft[:120] in note_text(n)
+                                                  for n in dup_notes)]
+                            if missing:
+                                amo("POST", f"/api/v4/leads/{dup}/notes",
+                                    [{"note_type": "common", "params": {"text":
+                                        "ВНИМАНИЕ: перенос расшифровки из дубля "
+                                        "заявлен, но заметка не появилась в "
+                                        f"карточке. Проверить дубль {lid} вручную."}}])
+                                log(f"  сделка {dup}: перенос расшифровки НЕ "
+                                    f"подтверждён ({len(missing)} зам.)")
+                        except Exception as e:
+                            log(f"  сделка {dup}: не удалось проверить перенос ({e})")
                     log(f"  сделка {lid}: оболочка звонка {phone} — дубль {dup}, закрыто")
                     processed.append({"lead_id": lid, "category": "call-shell-dup", "dup_of": dup})
                     continue

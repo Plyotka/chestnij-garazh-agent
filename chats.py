@@ -89,7 +89,8 @@ SAM_NABERET_RE = re.compile(
     r"подумаю|подумать|напишу (вам )?позже|сам (наберу|позвоню)|перезвоню|"
     r"свяжусь (с вами|позже)|свяжусь\b|связаться|наберу|отпишусь|"
     r"позвоню (вам )?(завтра|позже|сегодня|вечером|утром)|"
-    r"напишу (вам )?(завтра|сегодня|вечером|позже)|на следующей неделе",
+    r"напишу (вам )?(завтра|сегодня|вечером|позже)|на следующей неделе|"
+    r"обращусь|не знаю когда|когда будет удобно|пока не планирую|пока не знаю",
     re.IGNORECASE)
 # клиент закрывает вопрос сам → закрываем сделку без сообщений
 CLOSE_RE = re.compile(
@@ -118,7 +119,8 @@ SENT_KEY_RE = re.compile(r"Отправлено клиенту \((.+?)\):")
 SCHED_RE = re.compile(
     r"сегодня|завтра|послезавтра|суббот|воскресен|понедельник|вторник|среду|"
     r"четверг|пятницу|\b\d{1,2}[./ ]\d{1,2}\b|приеду|подъеду|заеду|привезу|"
-    r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}", re.IGNORECASE)
+    r"до обеда|утр|вечер|час(а|ов)?\b|к \d{1,2}[.:]?\d{0,2}|"
+    r"в \d{1,2}[.:]?\d{0,2}\b", re.IGNORECASE)
 # клиент «вот-вот приедет» → никаких дожимов, только задача «Приехал?»
 # (кейс Никита-форсунки 07.11: «щас ищу кто прикурит», а контур слал
 # «актуален?» каждый день — владелец: «ждёт пока прикурит, а мы долбим»)
@@ -126,6 +128,16 @@ PATIENT_RE = re.compile(
     r"прикур|выехал|уже еду|в пути|доезжаю|скоро буду|через \d+ минут|"
     r"сейчас подъеду|сейчас приеду|позже приеду|подъеду позже|минут через|"
     r"по пути|собираюсь выезжать", re.IGNORECASE)
+# отметка человека «не приехал» → ветка переноса/закрытия, не дожим
+# (кейс Nikolay 10.11: «Не приехал» в заметке не вело никуда, сделка висела)
+NO_SHOW_RE = re.compile(
+    r"не приехал|не приш[её]л|не дождались", re.IGNORECASE)
+# только приветствие от сервиса → интерес не «разобран», отвечает Бадри
+# (кейс Кирилл/редуктор 10.11: сервис написал только «Здравствуйте», а
+# сделка ушла в «Тёплые» вопросом, на который ещё не ответили)
+GREETING_RE = re.compile(
+    r"^\s*(здравствуйте|добрый (день|вечер|утро)|привет)\.?!?\s*$",
+    re.IGNORECASE)
 # VIN: 17 латинских букв/цифр подряд (клиенты часто пишут с пробелами — сжимаем)
 VIN_RUN_RE = re.compile(r"[A-HJ-NPR-Z0-9]{17}")
 def has_vin(text):
@@ -441,6 +453,13 @@ def followup_engine(tok):
     def open_tasks(l):
         return [t for t in embedded(l, "tasks") if not t.get("is_completed")]
 
+    def has_manual_task(tasks):
+        # «любая открытая задача» не считается: устаревшая «Когда приедет?»
+        # иначе навсегда блокирует ветку ручного дожима (кейс Nikolay 10.11)
+        return any("дожать" in (t.get("text") or "").lower()
+                   or "вручную" in (t.get("text") or "").lower()
+                   for t in tasks)
+
     def add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
         _task_cache.pop(lead_id, None)  # кеш открытых задач протух
         amo("POST", "/api/v4/tasks", [{
@@ -491,7 +510,8 @@ def followup_engine(tok):
         except Exception:
             continue
         cid, last_sent_ts, n_sent, last_key = None, 0, 0, None
-        sam_due = None
+        sam_due, no_show = None, False
+        fup_ts = []
         for n in sorted(notes, key=lambda x: x.get("created_at") or 0):
             t = ((n.get("params") or {}).get("text") or "")
             m = CHAT_ID_RE.search(t)
@@ -507,10 +527,13 @@ def followup_engine(tok):
                 if any(k in key for k in FUP_KEYS):
                     n_sent += 1
                     last_key = key
+                    fup_ts.append(n.get("created_at") or 0)
             if "сам наберёт — вернуться" in t:
                 mm = re.search(r"после (\d+)", t)
                 if mm:
                     sam_due = int(mm.group(1))
+            if NO_SHOW_RE.search(t):
+                no_show = True
         if not cid:
             done["skip"] += 1
             continue
@@ -550,6 +573,33 @@ def followup_engine(tok):
                            "вежливо. Сделка оказалась в воронке по ошибке.")
                 done["refusal"] += 1
                 continue
+            # отказ сервиса по профилю + клиент молчит > суток → закрываем
+            # и без подтверждения «понял» (кейс Кирилл/редуктор 10.11:
+            # «не делаем» отправлено, клиент промолчал — сделка висела бы вечно)
+            if (last_out > last_in and ins and client_last_txt
+                    and any(REFUSAL_RE.search(t or "") for t in our_last2)
+                    and nowts - last_in >= 24 * 3600):
+                close_lead(lid, LOSS_NE_NASH_PROFIL,
+                           "Автозакрытие движка дожима: последняя реплика сервиса — "
+                           "отказ по профилю («не делаем/не занимаемся»), клиент "
+                           "молчит более суток. Закрыто без ожидания подтверждения.")
+                done["refusal"] += 1
+                continue
+            if no_show:
+                # отметка «не приехал» человеком: перенос или закрытие — за человеком
+                if not any("перенос" in (t.get("text") or "").lower()
+                           or "не приехал" in (t.get("text") or "").lower()
+                           for t in tasks):
+                    add_task(lid, "Kimi для Константина: клиент НЕ ПРИЕХАЛ "
+                             f"({(l.get('name') or 'сделка')[:50]}) — уточнить "
+                             "перенос или закрыть. Далее: молчит сутки после "
+                             "уточнения → прощание и закрытие «Пропала "
+                             "потребность»", nowts + 3600)
+                    amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                        "text": "Отметка «не приехал» — движок не дожимает, "
+                                "поставлена задача уточнить перенос или закрыть."}}])
+                    done["human"] += 1
+                continue
             if sam_due and nowts < sam_due:
                 continue  # клиент просил сам набрать — ждём срока
             # дожим проигнорирован ≥ суток → прощаемся и закрываем (владелец 06.11)
@@ -566,7 +616,12 @@ def followup_engine(tok):
             if n_sent > 0 and nowts - last_sent_ts < FUP_GAP * 3600:
                 continue
             if sam_due and nowts >= sam_due:
-                send(lid, cid, T_SOFT, "soft")
+                # возврат после «сам наберёт» — ОДИН раз: после него работает
+                # общая лестница (кейс Максим/шлифовка 10.11: soft уходил
+                # каждые ~20 ч бесконечно, прощание с закрытием было
+                # недостижимо — 24 ч тишины после soft не наступали никогда)
+                if not any(ts > sam_due for ts in fup_ts):
+                    send(lid, cid, T_SOFT, "soft")
                 continue
             if last_in > last_out:  # клиент ждёт нашего ответа
                 if nowts - last_in < 2 * 3600:
@@ -657,15 +712,26 @@ def followup_engine(tok):
                                           tzinfo=MSK).timestamp())
                     continue
                 # вопрос по сути — нужен человек
-                if not tasks:
+                # своя задача на ответ по существу, а не «любая открытая»:
+                # иначе висящая «Когда приедет?» навсегда блокирует ветку
+                # (кейс Давид 10.11: «Пружин?» — содержательной задачи не
+                # появилось, ответ ушёл формальный «Я всё написал»)
+                if not any("по существу" in (t.get("text") or "").lower()
+                           or "ответить в чате" in (t.get("text") or "").lower()
+                           for t in tasks):
+                    # вопросы по услуге (не цена/не время) — Бадри, не Константин
+                    to_badri = ("?" in last_client
+                                and not PRICE_ASK_RE.search(last_client))
+                    who = BADRI if to_badri else KONSTANTIN
+                    whom = "Бадри" if to_badri else "Константина"
                     add_task(lid,
-                             "Kimi для Константина: Ответить в чате Авито — клиент ждёт "
+                             f"Kimi для {whom}: Ответить в чате Авито — клиент ждёт "
                              f"ответа по сути ({(l.get('name') or 'сделка')[:50]}). "
                              "Далее: ответили → уточнить время приезда → «Приедет»; "
                              "вопрос про цену — назвать цену, не запрашивать телефон раньше. "
                              "Пока не отвечено — задача переносится на следующий рабочий "
                              "день 10:00 автоматически (правило владельца 07.11)",
-                             nowts + 3 * 3600)
+                             nowts + 3 * 3600, who)
                     done["human"] += 1
                 continue
             # мы ответили последними — клиент молчит
@@ -673,8 +739,20 @@ def followup_engine(tok):
             # сервис «подъезжайте»): формально последняя реплика наша, но клиент
             # назвал день/время и сервис подтвердил — сделка должна быть в
             # «Приедет», а не дожиматься «актуален?»
-            last_ins_txt = [msg_text(m) for m in ins[:2]]
+            last_ins_txt = [msg_text(m) for m in ins[:4]]
             joint_in = " ".join(t or "" for t in last_ins_txt)
+            # клиент сам закрыл вопрос, даже если последней репликой ответил
+            # сервис (кейс Даниил 10.11: «не актуально» → сервис «Спасибо
+            # большое» — CLOSE_RE стоял только в ветке «клиент ждёт ответа»
+            # и сделка висела открытой)
+            if client_last_txt and CLOSE_RE.search(client_last_txt):
+                loss = (LOSS_DRUGIE if "друг" in client_last_txt.lower()
+                        else LOSS_PROPALA)
+                close_lead(lid, loss,
+                           f"Клиент сам закрыл вопрос: «{client_last_txt[:120]}» — "
+                           f"сделка закрыта автоматически (правило владельца 06.11).")
+                done["closed"] += 1
+                continue
             if (l.get("status_id") != ST_PRIEDET and last_ins_txt
                     and any(SCHED_RE.search(t or "") for t in last_ins_txt)
                     and not CLOSE_RE.search(joint_in)
@@ -694,7 +772,8 @@ def followup_engine(tok):
                     [{"note_type": "common", "params": {"text":
                         "Перевод в «Приедет» движком дожима: в последних сообщениях "
                         "клиент назвал день/время приезда, сервис подтвердил. "
-                        "Задача — подтвердить запись за день."}}])
+                        "Задача — подтвердить запись за день.\n"
+                        f"Сработавшие реплики клиента: «{joint_in[:150]}»"}}])
                 done["confirm"] += 1
                 continue
             # клиент «вот-вот приедет» — не долбим вообще (кейс Никита)
@@ -702,7 +781,7 @@ def followup_engine(tok):
                 continue
             silence = nowts - max(last_out, last_sent_ts)
             if n_sent >= 2 and silence >= 96 * 3600:
-                if not tasks:
+                if not has_manual_task(tasks):
                     add_task(lid, "Kimi для Константина: дожать сделку вручную — "
                              f"2 автокасания не дали ответа ({(l.get('name') or 'сделка')[:50]}). "
                              "Далее: нет ответа и после ручного дожима → «видим, что вопрос "
@@ -711,15 +790,28 @@ def followup_engine(tok):
                     done["manual"] += 1
                 continue
             if n_sent == 0 and silence >= FUP_SILENCE_FIRST * 3600:
-                # в «Приедет» «актуален?» не задаём — спрашиваем про перенос
-                # (кейс Никита-форсунки: долбили «актуален?», хотя клиент
-                # собирался приехать — владелец 07.11)
                 if l.get("status_id") == ST_PRIEDET:
-                    send(lid, cid, T_NEWDATE, "newdate")
+                    # T_NEWDATE только если клиент РЕАЛЬНО писал о переносе
+                    # (кейс Максим/Ларгус 10.11: «Приедет» + просто тишина →
+                    # клиенту ушло «переносим без проблем», хотя он переноса
+                    # не просил — владелец). Иначе — человеку подтвердить запись.
+                    if re.search(r"перенес|переношу|не получится|передумал|"
+                                 r"не смогу|по обстоятельствам", joint_in,
+                                 re.IGNORECASE):
+                        send(lid, cid, T_NEWDATE, "newdate")
+                    elif not any("подтвердить запись" in (t.get("text") or "").lower()
+                                 for t in tasks):
+                        add_task(lid, "Kimi для Константина: подтвердить запись — "
+                                 f"клиент в «Приедет» молчит >20 ч "
+                                 f"({(l.get('name') or 'сделка')[:50]}). Написать "
+                                 "«всё получается? К какому часу ждать?». Далее: "
+                                 "подтвердил → по факту «Приехал»; просит перенос "
+                                 "→ новая дата + задача за день", nowts + 3600)
+                        done["human"] += 1
                 else:
                     send(lid, cid, T_ACTUAL, "actual")
             elif n_sent >= 1 and silence >= 72 * 3600:
-                if not tasks:
+                if not has_manual_task(tasks):
                     add_task(lid, "Kimi для Константина: дожать сделку вручную — "
                              f"автокасания не дали ответа ({(l.get('name') or 'сделка')[:50]}). "
                              "Далее: нет ответа и после ручного дожима → «видим, что вопрос "
@@ -881,6 +973,9 @@ def run():
             request = (r.get("request") or "").strip()
             lead_name = f"{cname} — {request[:60]}" if request else f"Авито — {cname}"
             phone = norm_phone(r.get("phone") or "")
+            # сервис ответил только приветствием → интерес не «разобран»
+            greeting_only = bool(outs) and all(
+                GREETING_RE.match(msg_text(m) or "") for m in outs)
 
             if DRY_RUN:
                 log(f"  DRY_RUN {cname}: interest={interest}, next={r.get('next_step')}, phone={phone or '—'}")
@@ -911,6 +1006,19 @@ def run():
                 patch["status_id"] = ST_CLOSED
                 patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
                 note += f"\nПричина закрытия: {r.get('reason') or '—'}"
+            elif greeting_only:
+                # вопрос без ответа по существу — сначала отвечает Бадри
+                # (кейс Кирилл/редуктор 10.11: «Здравствуйте» + вопрос про
+                # редуктор ушли в «Тёплые» и висели без содержательной задачи)
+                patch["status_id"] = ST_TEPLY
+                patch["responsible_user_id"] = BADRI
+                note += ("\nСервис ответил только приветствием — первичный ответ "
+                         "по существу за Бадри.")
+                tasks.append(("Kimi для Бадри: ответить по существу в чате Авито — "
+                              f"клиент {cname} спросил: {request or '—'}. Далее: "
+                              "ответ по сути → уточнить время приезда → «Приедет»; "
+                              "не наш профиль → закрыть 143 с причиной.",
+                              BADRI, tomorrow_10_msk()))
             else:
                 if r.get("said_will_come") or phone:
                     patch["status_id"] = ST_PRIEDET
@@ -946,7 +1054,7 @@ def run():
             # Одна задача на сделку — только контрольная (решение владельца 06.11).
             sent = None
             pending = None
-            if interest and not phone:
+            if interest and not phone and not greeting_only:
                 tpl = None
                 if r.get("next_step") == "phone" or r.get("said_will_come"):
                     tpl = T_PHONE
