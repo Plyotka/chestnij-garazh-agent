@@ -62,6 +62,73 @@ def stuck_block(token):
         return [f"[РАДАР] не удалось построить ({e})"]
 
 
+RESP = {14367338: "Бадри", 14221122: "Константин"}
+
+
+def queue_digest(token):
+    """Утренняя сводка очереди (решение владельца 11.11): один читаемый
+    список «на сегодня» вместо столбца красного. Все открытые задачи с
+    сроком до конца сегодня (включая просроченные ранее), сгруппированы
+    по ответственным, с названиями сделок. Детерминированно, без LLM."""
+    try:
+        now = datetime.now(MSK)
+        end_of_day = int(datetime(now.year, now.month, now.day,
+                                  23, 59, tzinfo=MSK).timestamp())
+        url = (f"{AMO_BASE}/api/v4/tasks?filter[is_completed]=0"
+               f"&filter[complete_till][to]={end_of_day}&limit=250")
+        rows = []
+        while url:
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read().decode())
+            rows.extend((resp.get("_embedded") or {}).get("tasks") or [])
+            url = ((resp.get("_links") or {}).get("next") or {}).get("href")
+        if not rows:
+            return ["[ОЧЕРЕДЬ] на сегодня: задач нет — всё чисто"]
+        lead_ids = sorted({t["entity_id"] for t in rows if t.get("entity_id")})
+        leads = {}
+        for i in range(0, len(lead_ids), 50):
+            qs = "&".join(f"filter[id][]={x}" for x in lead_ids[i:i + 50])
+            req = urllib.request.Request(
+                f"{AMO_BASE}/api/v4/leads?{qs}&limit=250",
+                headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read().decode())
+            for l in (resp.get("_embedded") or {}).get("leads") or []:
+                leads[l["id"]] = (l.get("name") or "").strip()
+        grouped = {}
+        for t in rows:
+            who = RESP.get(t.get("responsible_user_id"),
+                           f"пользователь {t.get('responsible_user_id')}")
+            eid = t.get("entity_id")
+            nm = leads.get(eid) if eid else None
+            label = f"«{nm[:42]}»" if nm else "(вне сделок)"
+            txt = " ".join((t.get("text") or "").split())
+            txt = re.sub(r"^Kimi для \S+:\s*", "", txt)
+            due = datetime.fromtimestamp(t.get("complete_till") or 0, MSK)
+            over = (t.get("complete_till") or 0) < int(now.timestamp())
+            mark = "!" if over else " "
+            grouped.setdefault(who, []).append(
+                (t.get("complete_till") or 0,
+                 f"  [{mark}] {due.strftime('%d.%m %H:%M')} {label} — {txt[:70]}"))
+        lines = [f"[ОЧЕРЕДЬ] на сегодня: {len(rows)} задач"]
+        for who in ("Бадри", "Константин"):
+            if who in grouped:
+                lines.append(f" {who} ({len(grouped[who])}):")
+                for _, s in sorted(grouped[who]):
+                    lines.append(s)
+        for who, items in grouped.items():
+            if who not in ("Бадри", "Константин"):
+                lines.append(f" {who} ({len(items)}):")
+                for _, s in sorted(items):
+                    lines.append(s)
+        lines.append("  [!] = просрочена (ШАГ 0 перенесёт после 19:00)")
+        return lines
+    except Exception as e:
+        return [f"[ОЧЕРЕДЬ] не удалось построить ({e})"]
+
+
 def extract_summary(path, prefix=None):
     """Последняя JSON-строка summary из stdout-файла (в логе GH перед
     JSON может стоять временная метка — ищем '{' и парсим до конца строки)."""
@@ -169,6 +236,11 @@ def main():
         radar = stuck_block(token)
         if radar:
             parts += radar
+        # Утренняя сводка очереди — один раз, в прогоне 9:00–10:00 мск
+        # (решение владельца 11.11: один читаемый список «на сегодня»
+        # вместо столбца красных просроченных задач)
+        if 9 <= now.hour < 10:
+            parts += queue_digest(token)
 
     note = "\n".join(parts)
     print(note)
