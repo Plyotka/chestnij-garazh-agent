@@ -57,6 +57,7 @@ KONSTANTIN = 14221122
 ST_FIRST = 88470414   # Первичный контакт
 ST_TEPLY = 88470418   # Тёплые
 ST_PRIEDET = 88470422 # приедет
+ST_PRIEHAL = 88470426 # приехал
 ST_CLOSED = 143       # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
 TAG_CHAT = "Чат"  # тег сделок чат-контура Авито
@@ -96,7 +97,9 @@ SAM_NABERET_RE = re.compile(
 CLOSE_RE = re.compile(
     r"не актуал|неактуал|уже не нужн|уже сделал|сделал в другом месте|"
     r"в другом месте|выбрал других|у других|передумал|не интересует|отказ|"
-    r"не требуется|пока не нужн|не буду|отпад|отказал|хватит|отпишитесь",
+    r"не требуется|пока не нужн|не буду|отпад|отказал|хватит|отпишитесь|"
+    r"наш(е|ё)л(а)? (уже )?(друг|решени|где|вариант|мастер|сервис|специалист)"
+    r"|нашол (уже )?(друг|решени|где)|сам разобрался|решил(а)? сам|сам(а)? починил|уже решил",
     re.IGNORECASE)
 # финал переписки — отказ сервиса + вежливое подтверждение клиента = НЕ интерес
 # (кейс Данил 06.11: «Таким не занимаемся» → «Понял» — контур кинул в тёплые и
@@ -108,6 +111,13 @@ REFUSAL_RE = re.compile(
     r"не пролезет|в бокс не|не поместится", re.IGNORECASE)
 ACK_RE = re.compile(r"^(по?нял|ясно|спасибо|ок\b|окей|хорошо|ладно|понятно|"
                     r"хорош|благодарю|да нет|нет спасибо)", re.IGNORECASE)
+# F17: короткое подтверждение без вопроса — НЕ «вопрос по существу» (кейсы
+# Егор Пилипец/Евгений 11.11: на «Отлично» и «Принял, спасибо» движок
+# пересоздавал задачу «ответить по существу» и блокировал себе дожим).
+ACK_ANY_RE = re.compile(
+    r"^(отлично|супер|здорово|принял|приняла|жду|до встречи|договорились|"
+    r"хорошо|спасибо|благодарю|ок\b|окей|понял|поняла|ясно|понятно|ладно|"
+    r"буду|согласен|согласна|высылайте|ждём)\b", re.IGNORECASE)
 # ключи последней отправки, после которых тишина ≥24 ч → T_BYE и закрытие
 BYE_KEYS = ("actual", "soft", "дожим дневного прогона", "дожим актуальности")
 # шаговые ключи дожима — только они образуют лестницу (T_ACTUAL → T_SOFT → bye);
@@ -333,6 +343,66 @@ def find_chat_for_item(item, by_name):
         if d < best_d:
             best, best_d = c, d
     return (best, best_d) if best_d <= 3600 else (None, best_d)
+
+
+PHONE_SCAN_RE = re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*\d{3}[\s\-]?\d{2}[\s\-]?\d{2}")
+
+
+def scan_phone(msgs):
+    """Детерминированный поиск телефона КЛИЕНТА во входящих (F18): LLM иногда
+    теряет номер, а владелец требует 'оставил номер — занеси в карточку'
+    (кейсы Иван/whtevr 11.11). Возвращает +7XXXXXXXXXX или None."""
+    for m in msgs:
+        if m.get("direction") != "in":
+            continue
+        mm = PHONE_SCAN_RE.search(msg_text(m) or "")
+        if mm:
+            ph = norm_phone(mm.group(0))
+            if ph:
+                return ph
+    return None
+
+
+def ensure_contact_phone(lid, lead_name, phone):
+    """Телефон из чата — в контакт сделки (создать контакт при отсутствии,
+    привязка через /link — _embedded при создании сделку не привязывает)."""
+    try:
+        contacts = embedded(amo_get(f"/api/v4/leads/{lid}?with=contacts"), "contacts")
+        if not contacts:
+            created = amo("POST", "/api/v4/contacts", [{
+                "name": (lead_name or f"Клиент {phone}")[:100],
+                "custom_fields_values": [{"field_id": PHONE_FIELD,
+                                          "values": [{"value": phone}]}]}])
+            cid2 = ((created.get("_embedded") or {}).get("contacts") or [{}])[0].get("id")
+            if cid2:
+                amo("POST", f"/api/v4/leads/{lid}/link",
+                    [{"to_entity_id": cid2, "to_entity_type": "contacts"}])
+            return True
+        patched = False
+        for c in contacts:
+            try:
+                detail = amo_get(f"/api/v4/contacts/{c['id']}")
+                vals = detail.get("custom_fields_values") or []
+                has = any(v.get("field_id") == PHONE_FIELD and v.get("values")
+                          for v in vals)
+            except Exception:
+                has = True
+            if not has:
+                amo("PATCH", "/api/v4/contacts", [{"id": c["id"],
+                     "custom_fields_values": [{"field_id": PHONE_FIELD,
+                                               "values": [{"value": phone}]}]}])
+                patched = True
+        return patched
+    except Exception:
+        return False
+
+
+# правило владельца 11.11: клиент сообщает, что УЖЕ БЫЛ у нас → просим отзыв
+CLIENT_WAS_RE = re.compile(
+    r"был(а)? (у вас|в сервисе|к вам)|приезжал(а)? (к вам|к нам)|"
+    r"сделал(а)? (у вас|тут|здесь)|обслуживал(ся|ась) у вас|"
+    r"сделали у вас|пользовал(ся|ась) вашими услугами|делали (у вас|тут)",
+    re.IGNORECASE)
 
 
 def send_pending_templates(tok):
@@ -580,6 +650,34 @@ def followup_engine(tok):
         outs = [m for m in msgs if m.get("direction") == "out"]
         if not outs:  # Бадри ещё не отвечал — агент молчит (жёсткое правило)
             continue
+        # F18: телефон клиента из чата — детерминированно в контакт (не ждём LLM)
+        ph = scan_phone(msgs)
+        if ph and not any("Телефон из чата" in ((n.get("params") or {}).get("text") or "")
+                          for n in notes):
+            if ensure_contact_phone(lid, l.get("name") or "", ph):
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common",
+                    "params": {"text": f"Телефон из чата: {ph} (детерминированный "
+                                       "скан входящих — F18)"}}])
+                log(f"  дожим+ {lid}: телефон из чата {ph} — в контакт")
+        # F19 (правило владельца 11.11): клиент пишет, что УЖЕ БЫЛ у нас →
+        # поблагодарить и попросить отзыв. Срабатывает один раз (маркер-заметка).
+        if l.get("status_id") in (ST_PRIEHAL, 142) and ins:
+            if not any("отзыв" in (((n.get("params") or {}).get("text") or "").lower())
+                       for n in notes):
+                joined_recent = " ".join(msg_text(m) for m in ins[:6])
+                if CLIENT_WAS_RE.search(joined_recent):
+                    add_task(lid,
+                             "Kimi для Бадри: клиент сообщил, что уже был у нас — "
+                             f"поблагодарить и попросить оставить отзыв на Авито "
+                             f"({(l.get('name') or 'сделка')[:50]}). Далее: отзыв "
+                             "оставлен → заметка в сделку",
+                             BADRI, nowts + 4 * 3600)
+                    amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common",
+                        "params": {"text": "Клиент пишет, что уже был у нас — по "
+                                           "правилу владельца 11.11 ставим задачу "
+                                           "попросить отзыв."}}])
+                    done["human"] += 1
+                    continue
         last_in = max((m.get("created") or 0) for m in ins) if ins else 0
         last_out = max((m.get("created") or 0) for m in outs) if outs else 0
         nowts = int(now.timestamp())
@@ -631,8 +729,11 @@ def followup_engine(tok):
                                 "поставлена задача уточнить перенос или закрыть."}}])
                     done["human"] += 1
                 continue
-            if sam_due and nowts < sam_due:
-                continue  # клиент просил сам набрать — ждём срока
+            # F13 (кейс Надежда 11.11): ожидание «сам наберёт» (sam_due) не должно
+            # блокировать НОВОЕ сообщение клиента — клиентка сама вернулась
+            # («сегодня около 10-11 можно приехать?»), а движок её игнорировал.
+            if sam_due and nowts < sam_due and last_in <= last_out:
+                continue  # клиент просил сам набрать — ждём срока, пока он молчит
             # дожим проигнорирован ≥ суток → прощаемся и закрываем (владелец 06.11)
             if (last_key and any(k in last_key for k in BYE_KEYS)
                     and last_in < last_sent_ts
@@ -715,6 +816,15 @@ def followup_engine(tok):
                 if "перенес" in last_client.lower() or "не получится" in \
                         last_client.lower() or "переношу" in last_client.lower():
                     send(lid, cid, T_NEWDATE, "newdate")
+                    # F14 (кейсы Даниил/Александр 11.11): задача «за день до
+                    # приезда» при неизвестной дате — ерунда. Заменяем контрольную
+                    # задачу на «ждём новую дату» (add_task сам закрывает старую).
+                    add_task(lid,
+                             "Kimi для Константина: клиент просил перенос — "
+                             f"ждём новую дату ({(l.get('name') or 'сделка')[:50]}). "
+                             "Далее: назвал дату → «Приедет» + задача за день; молчит "
+                             "2 суток → «актуален?» по схеме",
+                             nowts + 2 * 86400)
                     continue
                 if SCHED_RE.search(last_client):
                     # клиент ждёт просчёт → не приглашаем, пока цена не названа
@@ -747,6 +857,11 @@ def followup_engine(tok):
                 # иначе висящая «Когда приедет?» навсегда блокирует ветку
                 # (кейс Давид 10.11: «Пружин?» — содержательной задачи не
                 # появилось, ответ ушёл формальный «Я всё написал»)
+                # F17: короткое подтверждение без вопроса («Отлично», «Принял,
+                # спасибо») — не вопрос по существу, задачу не ставим
+                if (len(last_client) <= 30 and "?" not in last_client
+                        and ACK_ANY_RE.match(last_client)):
+                    continue
                 if not any("по существу" in (t.get("text") or "").lower()
                            or "ответить в чате" in (t.get("text") or "").lower()
                            for t in tasks):
@@ -832,23 +947,30 @@ def followup_engine(tok):
                 continue
             if n_sent == 0 and silence >= FUP_SILENCE_FIRST * 3600:
                 if l.get("status_id") == ST_PRIEDET:
-                    # T_NEWDATE только если клиент РЕАЛЬНО писал о переносе
-                    # (кейс Максим/Ларгус 10.11: «Приедет» + просто тишина →
-                    # клиенту ушло «переносим без проблем», хотя он переноса
-                    # не просил — владелец). Иначе — человеку подтвердить запись.
                     if re.search(r"перенес|переношу|не получится|передумал|"
                                  r"не смогу|по обстоятельствам", joint_in,
                                  re.IGNORECASE):
                         send(lid, cid, T_NEWDATE, "newdate")
-                    elif not any("подтвердить запись" in (t.get("text") or "").lower()
-                                 for t in tasks):
-                        add_task(lid, "Kimi для Константина: подтвердить запись — "
-                                 f"клиент в «Приедет» молчит >20 ч "
-                                 f"({(l.get('name') or 'сделка')[:50]}). Написать "
-                                 "«всё получается? К какому часу ждать?». Далее: "
-                                 "подтвердил → по факту «Приехал»; просит перенос "
-                                 "→ новая дата + задача за день", nowts + 3600)
-                        done["human"] += 1
+                        add_task(lid,
+                                 "Kimi для Константина: клиент просил перенос — "
+                                 f"ждём новую дату ({(l.get('name') or 'сделка')[:50]}). "
+                                 "Далее: назвал дату → «Приедет» + задача за день; "
+                                 "молчит 2 суток → «актуален?» по схеме",
+                                 nowts + 2 * 86400)
+                    else:
+                        # F15 (кейс Егор-капремонт 11.11): «Приедет» + тишина
+                        # без даты — ветка молчала, добавляя только задачу
+                        # («подтвердить запись» ещё и блокировала всё, т.к.
+                        # содержит слова «подтвердить запись»). По схеме
+                        # владельца здесь идёт лестница: «актуален?» → сутки
+                        # тишины → прощание + закрытие (BYE_KEYS уже умеет).
+                        send(lid, cid, T_ACTUAL, "actual")
+                        add_task(lid,
+                                 "Kimi для Константина: «актуален?» отправлено "
+                                 f"({(l.get('name') or 'сделка')[:50]}). Далее: "
+                                 "молчит сутки → прощание и закрытие «Пропала "
+                                 "потребность»; ответил → диалог по схеме",
+                                 nowts + 24 * 3600)
                 else:
                     send(lid, cid, T_ACTUAL, "actual")
             elif n_sent >= 1 and silence >= 72 * 3600:
@@ -1026,6 +1148,9 @@ def run():
             request = (r.get("request") or "").strip()
             lead_name = f"{cname} — {request[:60]}" if request else f"Авито — {cname}"
             phone = norm_phone(r.get("phone") or "")
+            if not phone:
+                # F18: LLM иногда теряет номер — детерминированный скан чата
+                phone = scan_phone(msgs)
             # сервис ответил только приветствием → интерес не «разобран»
             greeting_only = bool(outs) and all(
                 GREETING_RE.match(msg_text(m) or "") for m in outs)
