@@ -484,6 +484,15 @@ def followup_engine(tok):
 
     def add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
         _task_cache.pop(lead_id, None)  # кеш открытых задач протух
+        # Правило владельца 06.11 (доуточнено 11.11): ОДНА открытая Kimi-задача
+        # на сделку. Новая контрольная закрывает прежние — иначе копились пары
+        # «Когда приедет?» + «за день до приезда подтвердить» (кейс 11.11:
+        # на 4 сделках висело по 2 задачи, очередь раздута вдвое).
+        mine = [t for t in open_tasks_by_id(lead_id)
+                if (t.get("text") or "").startswith("Kimi для")]
+        if mine:
+            amo("PATCH", "/api/v4/tasks",
+                [{"id": t["id"], "is_completed": True} for t in mine])
         amo("POST", "/api/v4/tasks", [{
             "text": text, "responsible_user_id": responsible,
             "complete_till": int(till_ts), "entity_id": lead_id,
