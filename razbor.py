@@ -50,6 +50,12 @@ ST_CLOSED = 143            # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
 LOSS_NE_DOZVON = 24853446  # Не дозвонились
 LOSS_DUBL = 24765102       # Дубль
+LOSS_PROPALA = 24393498    # Пропала потребность
+# отказ/неактуальность КЛИЕНТА (для причины закрытия и детерминированной страховки)
+CLIENT_REFUSED_RE = re.compile(
+    r"уже не\s?актуально|уже не\s?нужн|больше не\s?нужн|уже (сделал|обслуж|отремонтир|отказ)"
+    r"|сделал(а)? (у|в) других|передумал(а)?|отказал(ся|ась|ись)? от (визита|записи|услуги)"
+    r"|отпад|неинтересно", re.IGNORECASE)
 TAG_CALL = "Звонок"  # тег сделок звонкового контура
 
 STAGE_RANK = {ST_NERAZOB: 0, ST_FIRST: 1, ST_TEPLY: 2, ST_PRIEDET: 3, ST_PRIEHAL: 4}
@@ -585,6 +591,14 @@ def apply_result(lead, r, now, phone_guess=None, transcript=""):
         cat = 3
         r = dict(r, category=3)
         r["outcome"] = (r.get("outcome") or "") + " [повышено до 3: назван день приезда]"
+    # F12-страховка: LLM (temperature=1) дал 1 или 2, но в свежей расшифровке
+    # клиент сам закрыл вопрос («уже неактуально» — кейс «печка не дует» 11.11:
+    # модель даже написала «клиент отказался», но присвоила категорию 1).
+    if cat in (1, 2) and CLIENT_REFUSED_RE.search((transcript or "")[-1200:]):
+        cat = 5
+        r = dict(r, category=5)
+        r["close_reason"] = ((r.get("close_reason") or "") +
+                             " [повышено до 5: клиент отказался в расшифровке]")
     lead_name = (r.get("lead_name") or "").strip() or lead.get("name") or f"Сделка {lid}"
 
     cur_status = lead.get("status_id")
@@ -640,7 +654,15 @@ def apply_result(lead, r, now, phone_guess=None, transcript=""):
             task_due = int(arr)
     elif cat == 5:
         patch["status_id"] = ST_CLOSED
-        patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
+        # F12 (кейс «Авто — печка не дует» 11.11): отказ КЛИЕНТА («уже неактуально»)
+        # — это «Пропала потребность», а не «Не наш профиль» (иначе сводка причин
+        # закрытий врёт и причёска объявлений идёт по ложным данным).
+        tail5 = " ".join(str(r.get(k) or "") for k in ("close_reason", "outcome")) \
+                + "\n" + (transcript or "")[-800:]
+        if CLIENT_REFUSED_RE.search(tail5):
+            patch["loss_reason_id"] = LOSS_PROPALA
+        else:
+            patch["loss_reason_id"] = LOSS_NE_NASH_PROFIL
     elif cat == 4:
         # Категория 4 вне «приехал» → поднять сделку в «приехал» (повышение разрешено;
         # правило 28.10, уточнение владельца). Задачу не ставим, ответственного не меняем.
