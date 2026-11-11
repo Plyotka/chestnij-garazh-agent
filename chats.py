@@ -61,6 +61,7 @@ ST_PRIEHAL = 88470426 # приехал
 ST_CLOSED = 143       # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
 TAG_CHAT = "Чат"  # тег сделок чат-контура Авито
+TAG_CALL = "Звонок"  # тег сделок звонкового контура (razbor.py)
 PHONE_FIELD = 1133163
 
 # утверждённые шаблоны исходящих (только они, ничего от LLM клиенту)
@@ -307,6 +308,72 @@ def norm_phone(raw):
     if len(digits) == 11 and digits[0] in "78":
         return "+7" + digits[1:]
     return None
+
+
+def adopt_integration_leads(tok, by_name, now):
+    """F23 (кейс «Замена амортизаторов»/Сергей 11.11): интеграция Авито→amo
+    иногда принимает чат НАПРЯМУЮ в воронку (created_by=0), минуя лоток —
+    такая сделка без тега «Чат» и без chat_id= в заметках невидима для дожима
+    и висит мёртвым грузом. Находим открытые сделки без меток контура,
+    сопоставляем с чатом по имени контакта (+близость времени), ставим
+    тег «Чат» и заметку с chat_id= — дальше сделку ведёт followup_engine."""
+    from_ts = int((now - timedelta(days=3)).timestamp())
+    try:
+        resp = amo_get(f"/api/v4/leads?filter[pipeline_id][]=11282498"
+                       f"&filter[updated_at][from]={from_ts}&limit=250")
+    except Exception as e:
+        log(f"усыновление: не удалось получить сделки ({e})")
+        return 0
+    adopted = 0
+    for l in embedded(resp, "leads"):
+        if l.get("status_id") in (ST_CLOSED, 142):
+            continue
+        tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
+        if TAG_CHAT in tags or TAG_CALL in tags:
+            continue
+        lid = l["id"]
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"), "notes")
+            if any(CHAT_ID_RE.search(((n.get("params") or {}).get("text") or ""))
+                   for n in notes):
+                continue
+            full = amo_get(f"/api/v4/leads/{lid}?with=contacts")
+            names = []
+            for c in embedded(full, "contacts"):
+                nm = (c.get("name") or "").strip().lower()
+                # имя контакта, не похожее на телефон/системное
+                if nm and not re.match(r"^[+\d\s()\-]+$", nm):
+                    names.append(nm)
+            best, best_d = None, 1e18
+            for nm in names:
+                for c in by_name.get(nm, []):
+                    d = abs((c.get("created") or 0) - (l.get("created_at") or 0))
+                    if d < best_d:
+                        best, best_d = c, d
+            if not best:
+                # имени нет (контакт пустой, кейс «Замена амортизаторов») —
+                # допускаем чисто временной подбор, но с жёстким окном
+                for c in by_name.get("*", []):
+                    d = abs((c.get("created") or 0) - (l.get("created_at") or 0))
+                    if d < best_d:
+                        best, best_d = c, d
+            limit = 6 * 3600 if names else 2 * 3600
+            if not best or best_d > limit:
+                continue
+            cid = best["id"]
+            amo("PATCH", "/api/v4/leads", [{"id": lid,
+                 "_embedded": {"tags": [{"name": TAG_CHAT}]}}])
+            amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                "text": f"Сделка принята интеграцией Авито напрямую (F23, {now.strftime('%d.%m.%Y %H:%M')}) — "
+                        f"подхвачена в чат-контур: chat_id={cid}. Клиент: {names[0] if names else '?'}. "
+                        f"Дальше — стандартный дожим по схеме."}}])
+            adopted += 1
+            log(f"  усыновление: сделка {lid} «{(l.get('name') or '')[:40]}» → chat {cid[:10]}… (Δ{int(best_d)}с)")
+        except Exception as e:
+            log(f"  усыновление {lid}: ошибка ({e})")
+    if adopted:
+        log(f"усыновление: подхвачено {adopted} интеграционных сделок")
+    return adopted
 
 
 def find_chat_for_item(item, by_name):
@@ -1049,6 +1116,13 @@ def run():
                 continue
             by_name.setdefault(nm, []).append(c)
         by_name.setdefault("*", []).append(c)  # fallback-пул для поиска по времени
+
+    # F23: подхват сделок, принятых интеграцией Авито напрямую (мимо лотка) —
+    # без этого они невидимы для дожима (кейс «Замена амортизаторов» 11.11)
+    try:
+        adopt_integration_leads(tok, by_name, now)
+    except Exception as e:
+        log(f"усыновление: ошибка ({e})")
 
     unsorted = [u for u in embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
                 if "avito" in (u.get("source_name") or "").lower()]
