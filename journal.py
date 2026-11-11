@@ -219,6 +219,10 @@ def main():
 
     if ch is None:
         parts.append("[ЧАТЫ] прогон не отработал (см. лог GitHub)")
+    elif ch.get("window_skip"):
+        # chats.py печатает SUMMARY_JSON и при выходе по окну (F20) —
+        # у такого summary нет ключей acted/skipped (кейс 11.11: KeyError)
+        parts.append("[ЧАТЫ] вне рабочего окна — прогон пропущен")
     else:
         parts.append(f"[ЧАТЫ] обработано {ch['acted']}, пропущено {ch['skipped']}, ошибок {ch['errors']} "
                      f"(заявок в лотке {ch['unsorted_chats']}, дожим отправлено {ch.get('followups', 0)})")
