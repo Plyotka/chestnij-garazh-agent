@@ -439,6 +439,24 @@ def process_unsorted(now):
                             upsert_task(dup, f"Kimi для Бадри: Перезвонить/актуализировать по пропущенному: {phone}",
                                         BADRI, today_18_msk())
                             log(f"  лоток: пропущенный {phone} — открытая сделка {dup}, дубль не создан, задача перезвона добавлена")
+                        # F21 (кейс 11.11): заявку в лотке API отклонить не даёт
+                        # (405 — платформенная ловушка) и она висела мусором.
+                        # Принимаем пустым телом и СРАЗУ закрываем «Дубль» —
+                        # лоток чист, дубль-сделка в закрытых с причиной.
+                        try:
+                            acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept", {})
+                            dup_lid = ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+                            if dup_lid:
+                                amo("PATCH", "/api/v4/leads", [{"id": dup_lid,
+                                     "name": f"Дубль — пропущенный {phone}",
+                                     "status_id": ST_CLOSED, "loss_reason_id": LOSS_DUBL}])
+                                amo("POST", f"/api/v4/leads/{dup_lid}/notes", [{"note_type": "common", "params": {
+                                    "text": f"Дубль: по номеру {phone} уже есть открытая сделка {dup} "
+                                            f"(задача перезвона там). Принято из лотка и закрыто "
+                                            f"автоматически — иначе заявка не удаляется (API 405)."}}])
+                                log(f"  лоток: заявка {str(uid)[:8]}… принята и закрыта как дубль")
+                        except Exception as e2:
+                            log(f"  лоток: не удалось перенести дубль в закрытые ({e2})")
                     else:
                         log(f"  DRY_RUN лоток: пропущенный {phone} — дубль, wait={wait}")
                     handled += 1
