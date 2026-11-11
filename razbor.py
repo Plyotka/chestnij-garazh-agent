@@ -51,6 +51,7 @@ LOSS_NE_NASH_PROFIL = 24763846
 LOSS_NE_DOZVON = 24853446  # Не дозвонились
 LOSS_DUBL = 24765102       # Дубль
 LOSS_PROPALA = 24393498    # Пропала потребность
+LOSS_DRUGIE = 24393506     # Выбрали других
 # отказ/неактуальность КЛИЕНТА (для причины закрытия и детерминированной страховки)
 CLIENT_REFUSED_RE = re.compile(
     r"уже не\s?актуально|уже не\s?нужн|больше не\s?нужн|уже (сделал|обслуж|отремонтир|отказ)"
@@ -845,6 +846,31 @@ def process_closed_task_loops(now, skip_ids=None):
             pass
         if not result_txt.strip():
             continue  # закрыта без комментария — не гадаем
+        # F22 (кейс «Пропущенный +79283033740» 11.11): результат закрытой
+        # человеком задачи читаем ДЕТЕРМИНИРОВАННО — если там «не наш профиль/
+        # закрыть/не актуально/у других» — сделка закрывается сразу, без LLM
+        # и без новых задач. Правило владельца 12.11: ручное закрытие финально,
+        # возвращать задачи не надо. LLM-цикл (decide_next_step) — только для
+        # живых исходов («перезвонил», «приедет», «думает»).
+        low = result_txt.lower()
+        if re.search(r"не наш профиль|не делаем|не занимаемся|не бер[её]м в работу|"
+                     r"закрыть|не актуал|передумал|у других|сделал у других|"
+                     r"не дозвон|не берет|не берёт|не беру[тт]", low):
+            loss = (LOSS_NE_NASH_PROFIL
+                    if re.search(r"профиль|не делаем|не занимаемся|не бер[её]м в работу", low)
+                    else LOSS_DRUGIE if re.search(r"у других|другой сервис", low)
+                    else LOSS_NE_DOZVON if re.search(r"не дозвон|не берет|не берёт|не беру[тт]", low)
+                    else LOSS_PROPALA)
+            if not DRY_RUN:
+                amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
+                                                "loss_reason_id": loss}])
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"Закрыто по результату задачи, закрытой человеком («{result_txt[:120]}») — "
+                            f"детерминированное правило F22, без LLM. Ручное закрытие финально."}}])
+                close_my_tasks(lid)
+            log(f"  цикл задачи {lid}: результат «{result_txt[:50]}» → сделка закрыта (F22)")
+            handled += 1
+            continue
         try:
             notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"), "notes")
             razbors = [(n.get("created_at") or 0, note_text(n)) for n in notes
