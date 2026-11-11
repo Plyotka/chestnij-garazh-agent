@@ -999,14 +999,21 @@ def run():
 
     # рабочее окно (мск): клиентам не пишем ночью, поэтому вне окна
     # весь чат-контур молчит (как razbor.py). В DRY_RUN окно не действует.
+    # F20 (кейс Артур 11.11): заявки 20:00–21:00 ПРИНИМАЕМ (задачи, этапы),
+    # но клиенту не пишем — отправки откладываются на утро (как NO_SEND).
     if not DRY_RUN:
         def _hm(s):
             h, m = s.split(":")
             return int(h) * 60 + int(m)
         cur = now.hour * 60 + now.minute
-        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "20:00"))):
+        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur
+                <= _hm(os.environ.get("CHAT_WINDOW_END", "21:00"))):
             log("вне рабочего окна — выход без действий")
+            print("SUMMARY_JSON:" + json.dumps(
+                {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True},
+                ensure_ascii=False))
             return {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True}
+    eff_no_send = NO_SEND or now.hour >= 20  # F20: вечер принимаем, не пишем
 
     tok = avito_token()
     acc = amo_get("/api/v4/account")
@@ -1259,7 +1266,7 @@ def run():
                                   "уточнить время приезда → запросить телефон.",
                                   KONSTANTIN, tomorrow_10_msk())]
                 if tpl:
-                    if NO_SEND:
+                    if eff_no_send:
                         pending = (cid, tpl)
                         note += (f"\nШаблон НЕ отправлен (ночь, дождётся дневного прогона), "
                                  f"chat_id={cid}: «{tpl}»")
@@ -1288,7 +1295,7 @@ def run():
 
     # дневной дожим ночных шаблонов (NO_SEND ничего не шлёт, только помечает)
     followups = 0
-    if not DRY_RUN and not NO_SEND:
+    if not DRY_RUN and not eff_no_send:
         try:
             followups = send_pending_templates(tok)
         except Exception as e:

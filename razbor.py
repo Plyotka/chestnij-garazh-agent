@@ -886,6 +886,9 @@ def run():
         cur = now.hour * 60 + now.minute
         if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "20:00"))):
             log("вне рабочего окна — выход без действий")
+            print("SUMMARY_JSON:" + json.dumps(
+                {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True},
+                ensure_ascii=False))
             return {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True}
 
     # проверка доступа
