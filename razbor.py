@@ -227,7 +227,11 @@ def upsert_task(lead_id, text, responsible_id, complete_till):
         f"/api/v4/tasks?filter[entity_id]={lead_id}&filter[entity_type][]=leads&filter[is_completed]=0&limit=100"
     )
     open_tasks = embedded(resp, "tasks")
-    mine = [t for t in open_tasks if (t.get("text") or "").startswith("Kimi для")]
+    # «мои» = задачи контура: по префиксу «Kimi для» ИЛИ «Далее:» — LLM иногда
+    # ставит задачу без префикса (кейс Kia Rio 12.11: две открытые задачи
+    # перезвона — префикс-less задача была невидима для дедупа, F25).
+    mine = [t for t in open_tasks
+            if (t.get("text") or "").startswith(("Kimi для", "Далее:"))]
     want = task_key(text)
     same = [t for t in mine if task_key(t.get("text") or "") == want]
     if same:
@@ -252,7 +256,8 @@ def close_my_tasks(lead_id):
     resp = amo_get(
         f"/api/v4/tasks?filter[entity_id]={lead_id}&filter[entity_type][]=leads&filter[is_completed]=0&limit=100"
     )
-    mine = [t for t in embedded(resp, "tasks") if (t.get("text") or "").startswith("Kimi для")]
+    mine = [t for t in embedded(resp, "tasks")
+            if (t.get("text") or "").startswith(("Kimi для", "Далее:"))]
     if mine:
         amo("PATCH", "/api/v4/tasks", [{"id": t["id"], "is_completed": True} for t in mine])
 
@@ -932,6 +937,12 @@ def process_closed_task_loops(now, skip_ids=None):
                 handled += 1
             elif action == "task" and d.get("task_text"):
                 resp_id = KONSTANTIN if d.get("responsible") == "Константин" else BADRI
+                text = str(d["task_text"]).strip()
+                # F25: префикс «Kimi для …» обязателен — без него задача
+                # невидима для дедупа контура и плодятся дубли (Kia Rio 12.11).
+                if not text.startswith(("Kimi для", "Далее:")):
+                    whom = "Константина" if resp_id == KONSTANTIN else "Бадри"
+                    text = f"Kimi для {whom}: {text}"
                 # F24: «сказал подумать/думает/сам наберёт» — возврат через 4 дня,
                 # а не через 12 ч (кейс +79518229971: клиент думает, а мы долбим).
                 if re.search(r"подум|думает|сам (набер|позвон)|перезвоню сам", result_txt, re.IGNORECASE):
@@ -939,7 +950,7 @@ def process_closed_task_loops(now, skip_ids=None):
                 else:
                     due_h = d.get("due_hours") if isinstance(d.get("due_hours"), (int, float)) else 12
                     due = int(now.timestamp()) + max(1, min(int(due_h), 96)) * 3600
-                upsert_task(lid, str(d["task_text"]).strip(), resp_id, due)
+                upsert_task(lid, text, resp_id, due)
                 amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
                     "text": f"Задача закрыта сотрудником («{result_txt[:120]}») → создан следующий шаг "
                             f"(шаг разбора закрытых задач): {d.get('why') or ''}"}}])
