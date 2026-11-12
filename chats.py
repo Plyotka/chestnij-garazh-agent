@@ -84,6 +84,14 @@ T_BYE = ("Здравствуйте! Видим, что вопрос, скоре�
          "закрываем обращение. Если передумаете — напишите, всегда подберём время.")
 T_ADDRESS = ("Наш адрес: Фурмановская улица, 150Б. Работаем с 9:00 до 19:00, "
              "в субботу до 17:00.")
+# F28: подтверждение записи накануне приезда (формулировка из регламента S4,
+# утверждена владельцем 05.11: «Да → за день до приезда → "Завтра ждём вас.
+# Всё получается приехать?"»)
+T_CONFIRM_DAY = "Добрый день! Завтра ждём вас. Всё получается приехать?"
+# F27: клиент сообщил, что УЖЕ приехал / ждёт на месте
+ARRIVED_RE = re.compile(
+    r"приехал(а)?\b|уже (у вас|здесь|жду)|жду (у входа|на парковке|у вас)|"
+    r"на месте|подъехал(а)? (к вам|уже)|стою (у вас|у входа)", re.IGNORECASE)
 # регулярка chat_id в заметках (движок дожима находит чат сделки по ней)
 CHAT_ID_RE = re.compile(r"chat_id=(u2i-[\w~\-]+)")
 # клиент «сам наберёт» → не дожимаем, напоминаем через 4 дня (схема владельца)
@@ -748,6 +756,49 @@ def followup_engine(tok):
         last_in = max((m.get("created") or 0) for m in ins) if ins else 0
         last_out = max((m.get("created") or 0) for m in outs) if outs else 0
         nowts = int(now.timestamp())
+        # F27 (кейс Егор Пилипец 12.11): клиент сообщил, что УЖЕ приехал /
+        # ждёт на месте → сделка в «Приехал», контрольные задачи закрываем.
+        # Раньше таких слов не было ни в одной регулярке — сделка висела
+        # в «Приедет», пока человек не перевёл руками.
+        if l.get("status_id") != ST_PRIEHAL and ins:
+            arr_txt = " ".join(msg_text(m) for m in ins[:3])
+            if ARRIVED_RE.search(arr_txt):
+                amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_PRIEHAL}])
+                close_my = open_tasks_by_id(lid)
+                mine = [t for t in close_my
+                        if (t.get("text") or "").startswith(("Kimi для", "Далее:"))]
+                if mine:
+                    amo("PATCH", "/api/v4/tasks",
+                        [{"id": t["id"], "is_completed": True} for t in mine])
+                    _task_cache.pop(lid, None)
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"Клиент сообщил о приезде (F27): «{arr_txt[:100]}» — сделка переведена "
+                            f"в «Приехал», контрольные задачи закрыты."}}])
+                done["confirm"] += 1
+                continue
+        # F28 (кейс Кирилл Тех 12.11): контрольная задача «за день до приезда
+        # подтвердить запись» ПРОСРОЧЕНА — человек не успел, а движок молчал:
+        # лестница «актуален?» только для бездатных, датные ждали человека.
+        # Теперь движок сам шлёт утверждённое подтверждение (регламент S4)
+        # и переставляет контроль на 9:00 следующего дня.
+        if l.get("status_id") == ST_PRIEDET and cid:
+            if any(("за день до приезда" in (t.get("text") or "")
+                    or "подтвердить запись" in (t.get("text") or ""))
+                   and (t.get("complete_till") or 0) < nowts
+                   for t in tasks):
+                if not any("confirm_day" in (((n.get("params") or {}).get("text") or ""))
+                           for n in notes):
+                    send(lid, cid, T_CONFIRM_DAY, "confirm_day")
+                    d9 = (now + timedelta(days=1)).date()
+                    add_task(lid,
+                             "Kimi для Константина: подтверждение «завтра ждём» отправлено "
+                             f"({(l.get('name') or 'сделка')[:50]}). День приезда: приехал → «Приехал»; "
+                             "молчит к вечеру → «Вы где?», потом перенос или закрытие",
+                             KONSTANTIN,
+                             datetime(d9.year, d9.month, d9.day, 9, 0,
+                                      tzinfo=MSK).timestamp())
+                    done["human"] += 1
+                    continue
         # open_tasks(l) НЕ работает: amoCRM не встраивает tasks в lead
         # (with=tasks игнорируется) — проверяем открытые задачи через API
         tasks = open_tasks_by_id(lid)
