@@ -355,6 +355,11 @@ def adopt_integration_leads(tok, by_name, now):
         tags = [t.get("name") for t in (l.get("_embedded") or {}).get("tags", [])]
         if TAG_CHAT in tags or TAG_CALL in tags:
             continue
+        # F23-огрех 12.11: оболочки телефонии («Исходящий/Входящий/Пропущенный
+        # звонок …») усыновились в чат-контур с чужим chat_id до того, как
+        # razbor закрыл их как дубли. Усыновляем только чат-подобные сделки.
+        if re.match(r"^\s*(исходящий|входящий|пропущенный) звонок", (l.get("name") or "").lower()):
+            continue
         lid = l["id"]
         try:
             notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"), "notes")
