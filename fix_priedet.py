@@ -125,9 +125,10 @@ def close_dead(lid, why_note):
 
 
 now = datetime.now(MSK)
-t10_13 = int(datetime(now.date() + timedelta(days=1), tzinfo=MSK).replace(hour=10).timestamp())
+d13 = now.date() + timedelta(days=1)
+t10_13 = int(datetime(d13.year, d13.month, d13.day, 10, 0, tzinfo=MSK).timestamp())
+t09_13 = int(datetime(d13.year, d13.month, d13.day, 9, 30, tzinfo=MSK).timestamp())
 t10_16 = int((now + timedelta(days=4)).replace(hour=10, minute=0, second=0, microsecond=0).timestamp())
-t09_13 = int(datetime(now.date() + timedelta(days=1), tzinfo=MSK).replace(hour=9, minute=30).timestamp())
 
 # 1. Денис — 5 суток тишины после confirm
 close_dead(37583383,
