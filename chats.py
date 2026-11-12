@@ -311,6 +311,22 @@ def next_9_msk():
     return int(ts.timestamp())
 
 
+# F31 (решение владельца 12.11): дожимы уходят ОДНОЙ утренней пачкой к началу
+# рабочего дня (окно 8:00–9:30 мск), а не хаотично по тикам весь день.
+# Обработка (приём, задачи, этапы) работает весь день — окно только на
+# отправку шаблонов из followup_engine/send_pending_templates.
+DAILY_SEND_START = os.environ.get("DAILY_SEND_START", "8:00")
+DAILY_SEND_END = os.environ.get("DAILY_SEND_END", "9:30")
+
+
+def in_daily_send_window(now=None):
+    def _hm(s):
+        h, m = s.split(":")
+        return int(h) * 60 + int(m)
+    cur = (now or datetime.now(MSK)).hour * 60 + (now or datetime.now(MSK)).minute
+    return _hm(DAILY_SEND_START) <= cur <= _hm(DAILY_SEND_END)
+
+
 def norm_phone(raw):
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits[0] in "78":
@@ -567,9 +583,24 @@ def followup_engine(tok):
             "sam_naberet": 0, "human": 0, "manual": 0, "skip": 0}
 
     def send(lead_id, cid, tpl, key):
+        if not in_daily_send_window(now):
+            # F31: дожим отложен до утреннего окна 8:00–9:30 — не шлём
+            # хаотично в течение дня (решение владельца 12.11)
+            log(f"  дожим+ {lead_id}: «{key}» отложен до утреннего окна {DAILY_SEND_START}–{DAILY_SEND_END}")
+            return False
         http("POST", f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}"
                      f"/chats/{cid}/messages", token=tok,
              body={"message": {"text": tpl}, "type": "text"})
+        # F30 (кейс Сергей/«Замена амортизаторов» 12.11): дожим ушёл —
+        # висящую контрольную задачу логично перенести на завтра, иначе
+        # отправили сообщение, а старая (часто уже просроченная) задача висит.
+        try:
+            till = tomorrow_10_msk()
+            for t in open_tasks_by_id(lead_id):
+                if (t.get("complete_till") or 0) < till:
+                    amo("PATCH", "/api/v4/tasks", [{"id": t["id"], "complete_till": till}])
+        except Exception:
+            pass
         # прогноз следующего шага — чтобы в карточке было видно, что будет
         # дальше без вопроса «какой следующий шаг?» (просьба владельца 07.11)
         nxt = ""
@@ -856,11 +887,11 @@ def followup_engine(tok):
             if (last_key and any(k in last_key for k in BYE_KEYS)
                     and last_in < last_sent_ts
                     and nowts - last_sent_ts >= 24 * 3600):
-                send(lid, cid, T_BYE, "bye")
-                close_lead(lid, LOSS_PROPALA,
-                           "Дожим не получил ответа более суток — отправлено "
-                           "прощальное сообщение, сделка закрыта «Пропала "
-                           "потребность» (схема владельца 06.11).")
+                if send(lid, cid, T_BYE, "bye"):
+                    close_lead(lid, LOSS_PROPALA,
+                               "Дожим не получил ответа более суток — отправлено "
+                               "прощальное сообщение, сделка закрыта «Пропала "
+                               "потребность» (схема владельца 06.11).")
                 continue
             # антиспам-зазор: после любой нашей отправки ≥FUP_GAP ч тишины
             if n_sent > 0 and nowts - last_sent_ts < FUP_GAP * 3600:
@@ -958,7 +989,8 @@ def followup_engine(tok):
                                .get("text") or "") and
                                (n.get("created_at") or 0) > last_in
                                for n in notes):
-                        send(lid, cid, T_CONFIRM, "confirm")
+                        if not send(lid, cid, T_CONFIRM, "confirm"):
+                            continue
                         amo("PATCH", "/api/v4/leads", [{"id": lid,
                              "status_id": ST_PRIEDET,
                              "responsible_user_id": KONSTANTIN}])
@@ -1053,7 +1085,8 @@ def followup_engine(tok):
             if overdue_manual and cid:
                 last_due = max(t.get("complete_till") or 0 for t in overdue_manual)
                 if last_in < last_due and nowts - last_due >= 3600:
-                    send(lid, cid, T_BYE, "bye")
+                    if not send(lid, cid, T_BYE, "bye"):
+                        continue
                     close_lead(lid, LOSS_PROPALA,
                                "Ручной дожим не дал ответа (задача просрочена, клиент молчит) — "
                                "прощание отправлено, сделка закрыта «Пропала потребность» "
@@ -1063,6 +1096,34 @@ def followup_engine(tok):
             # клиент «вот-вот приедет» — не долбим вообще (кейс Никита)
             if PATIENT_RE.search(joint_in):
                 continue
+            # F29 (кейс Евгений Иванович 12.11): висит задача «ответить по
+            # существу», но на вопрос клиента сервис УЖЕ ответил — вопрос снят
+            # нашим ответом. Автоматика молчала (F11 видел висящую задачу), а
+            # задача краснела. Закрываем её, контрольная — «Когда приедет?» на
+            # завтра. Срабатывает только если ответ новее последнего вопроса.
+            qs = [m for m in ins if "?" in (msg_text(m) or "")]
+            if qs and any("по существу" in (t.get("text") or "").lower()
+                          or "ответить в чате" in (t.get("text") or "").lower()
+                          for t in open_tasks_by_id(lid)):
+                q = max(qs, key=lambda m: m.get("created") or 0)
+                if any((m.get("created") or 0) >= (q.get("created") or 0)
+                       for m in outs):
+                    mine = [t for t in open_tasks_by_id(lid)
+                            if (t.get("text") or "").startswith(("Kimi для", "Далее:"))]
+                    amo("PATCH", "/api/v4/tasks",
+                        [{"id": t["id"], "is_completed": True} for t in mine])
+                    _task_cache.pop(lid, None)
+                    add_task(lid,
+                             "Kimi для Константина: Когда приедет? "
+                             f"({(l.get('name') or 'сделка')[:50]}). Далее: назвал "
+                             "дату → «Приедет» + контроль; молчит → дожим по схеме",
+                             KONSTANTIN, tomorrow_10_msk())
+                    amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                        "text": "F29: на вопрос клиента («" + (msg_text(q) or "")[:80] +
+                                "») сервис уже ответил — задача «ответить по существу» "
+                                "закрыта автоматически, контрольная на завтра."}}])
+                    done["human"] += 1
+                    continue
             # F11 (кейс Давид 11.11): висит открытая задача «ответить по существу»
             # — значит наш последний ответ вопрос клиента НЕ закрыл (Давид спросил
             # цену ручек+масла, получил ответ про пружины и «Я всё написал»).
@@ -1439,8 +1500,9 @@ def run():
             log(f"  ОШИБКА {cname}: {e}")
 
     # дневной дожим ночных шаблонов (NO_SEND ничего не шлёт, только помечает)
+    # F31: досылаем только утренним окном 8:00–9:30, как и весь дожим
     followups = 0
-    if not DRY_RUN and not eff_no_send:
+    if not DRY_RUN and not eff_no_send and in_daily_send_window(now):
         try:
             followups = send_pending_templates(tok)
         except Exception as e:
