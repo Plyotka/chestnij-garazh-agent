@@ -989,6 +989,26 @@ def followup_engine(tok):
                         f"Сработавшие реплики клиента: «{joint_in[:150]}»"}}])
                 done["confirm"] += 1
                 continue
+            # F26 (кейсы Денис/Даниил 12.11): «дожать вручную» — задача человеку.
+            # Если она ПРОСРОЧЕНА и клиент с тех пор молчит — человек не дожал,
+            # ждать больше нечего: прощание + закрытие «Пропала потребность»
+            # (раньше сделка зависала навсегда: касания исчерпаны, задача красная,
+            # движок ждал действий, которых не было).
+            manual_tasks = [t for t in tasks
+                            if "дожать" in (t.get("text") or "").lower()
+                            or "вручную" in (t.get("text") or "").lower()]
+            overdue_manual = [t for t in manual_tasks
+                              if (t.get("complete_till") or 0) < nowts]
+            if overdue_manual and cid:
+                last_due = max(t.get("complete_till") or 0 for t in overdue_manual)
+                if last_in < last_due and nowts - last_due >= 3600:
+                    send(lid, cid, T_BYE, "bye")
+                    close_lead(lid, LOSS_PROPALA,
+                               "Ручной дожим не дал ответа (задача просрочена, клиент молчит) — "
+                               "прощание отправлено, сделка закрыта «Пропала потребность» "
+                               "(финал после ручного дожима, F26).")
+                    done["bye"] += 1
+                    continue
             # клиент «вот-вот приедет» — не долбим вообще (кейс Никита)
             if PATIENT_RE.search(joint_in):
                 continue
