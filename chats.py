@@ -1027,9 +1027,19 @@ def followup_engine(tok):
                 if not any("по существу" in (t.get("text") or "").lower()
                            or "ответить в чате" in (t.get("text") or "").lower()
                            for t in tasks):
-                    # вопросы по услуге (не цена/не время) — Бадри, не Константин
-                    to_badri = ("?" in last_client
-                                and not PRICE_ASK_RE.search(last_client))
+                    # вопросы по услуге (не цена/не время) — Бадри, не Константин.
+                    # F32 (кейс Салим 13.11): стоимость ПЕРЕЧИСЛЕНИЯ работ/узлов
+                    # («сайлентблоки 2 передних, 2 задних, втулки, косточки») —
+                    # технический просчёт, требует мастера, а не администратора:
+                    # маршрутизируем на Бадри (по указанию владельца).
+                    if "?" in last_client and not PRICE_ASK_RE.search(last_client):
+                        to_badri = True
+                    elif (PRICE_ASK_RE.search(last_client)
+                            and (last_client.count(",") >= 1
+                                 or len(re.findall(r"\bи\b", last_client.lower())) >= 1)):
+                        to_badri = True
+                    else:
+                        to_badri = False
                     who = BADRI if to_badri else KONSTANTIN
                     whom = "Бадри" if to_badri else "Константина"
                     add_task(lid,
