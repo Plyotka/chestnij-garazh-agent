@@ -1442,7 +1442,7 @@ def run():
                 last_out_ts = next((m.get("created") or 0 for m in msgs
                                     if m.get("direction") == "out"), 0)
                 reason_txt = (r.get("reason") or "") + " " + (r.get("summary") or "")
-                if (nowts - last_out_ts) < FUP_SILENCE_FIRST * 3600 and re.search(
+                if (int(now.timestamp()) - last_out_ts) < FUP_SILENCE_FIRST * 3600 and re.search(
                         r"пропал|не ответил|молчит|уш[её]л|ушел", reason_txt, re.IGNORECASE):
                     interest = True
                     r["summary"] = ((r.get("summary") or "")
