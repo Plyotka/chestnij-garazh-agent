@@ -1017,6 +1017,13 @@ def followup_engine(tok):
                 if (len(last_client) <= 30 and "?" not in last_client
                         and ACK_ANY_RE.match(last_client)):
                     continue
+                # F17-доп (кейс whtevr 13.11): сообщение — только номер телефона
+                # (клиент оставляет номер по запросу) — это НЕ вопрос по существу.
+                # Иначе суть-задача пересоздаётся, блокирует дожим (F11) и сделка
+                # с датой приезда зависает без подтверждения.
+                if norm_phone(last_client) or (len(last_client) <= 20
+                        and PHONE_SCAN_RE.search(last_client)):
+                    continue
                 if not any("по существу" in (t.get("text") or "").lower()
                            or "ответить в чате" in (t.get("text") or "").lower()
                            for t in tasks):
