@@ -493,12 +493,61 @@ def ensure_contact_phone(lid, lead_name, phone):
         return False
 
 
+# F33: просьба об отзыве — шаблон утверждён владельцем 13.11
+T_REVIEW = ("Здравствуйте! Спасибо, что доверили нам автомобиль. Если визит понравился — "
+            "оставьте, пожалуйста, отзыв на нашем объявлении, это очень помогает. Всего доброго!")
+
 # правило владельца 11.11: клиент сообщает, что УЖЕ БЫЛ у нас → просим отзыв
 CLIENT_WAS_RE = re.compile(
     r"был(а)? (у вас|в сервисе|к вам)|приезжал(а)? (к вам|к нам)|"
     r"сделал(а)? (у вас|тут|здесь)|обслуживал(ся|ась) у вас|"
     r"сделали у вас|пользовал(ся|ась) вашими услугами|делали (у вас|тут)",
     re.IGNORECASE)
+
+
+
+def ask_reviews(tok, now):
+    """F33 (решение владельца 13.11): сделки «Успешно реализовано» (142) с
+    чатом Авито получают просьбу оставить отзыв — один раз, по маркеру-заметке.
+    Звонковые успехи сюда не попадают (нет chat_id) — там просьбу озвучивает
+    человек. Работает в рабочем окне прогона (9:00–21:00)."""
+    try:
+        resp = amo_get("/api/v4/leads?filter[pipeline_id][]=11282498"
+                       "&filter[statuses][]=142&limit=250")
+    except Exception as e:
+        log(f"отзывы: не удалось получить сделки ({e})")
+        return 0
+    wanted = {142}
+    sent_n = 0
+    for l in embedded(resp, "leads"):
+        if l.get("status_id") not in wanted:
+            continue  # фильтр статусов у токена игнорируется — перепроверяем
+        lid = l["id"]
+        try:
+            notes = embedded(amo_get(f"/api/v4/leads/{lid}/notes?limit=100"), "notes")
+            if any("Отзыв запрошен" in (((n.get("params") or {}).get("text") or ""))
+                   for n in notes):
+                continue
+            cid = None
+            for n in notes:
+                m = CHAT_ID_RE.search(((n.get("params") or {}).get("text") or ""))
+                if m:
+                    cid = m.group(1)
+            if not cid:
+                continue
+            http("POST", f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}"
+                         f"/chats/{cid}/messages", token=tok,
+                 body={"message": {"text": T_REVIEW}, "type": "text"})
+            amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                "text": f"Отзыв запрошен ({now.strftime('%d.%m.%Y')}, F33): отправлена просьба "
+                        f"оставить отзыв на Авито."}}])
+            sent_n += 1
+            log(f"  отзыв: сделка {lid} «{(l.get('name') or '')[:40]}» — просьба отправлена")
+        except Exception as e:
+            log(f"  отзыв {lid}: ошибка ({e})")
+    if sent_n:
+        log(f"отзывы: отправлено просьб {sent_n}")
+    return sent_n
 
 
 def send_pending_templates(tok):
@@ -1277,6 +1326,11 @@ def run():
         adopt_integration_leads(tok, by_name, now)
     except Exception as e:
         log(f"усыновление: ошибка ({e})")
+    # F33: просьба об отзыве у успешно реализованных чат-сделок (раз на сделку)
+    try:
+        ask_reviews(tok, now)
+    except Exception as e:
+        log(f"отзывы: ошибка ({e})")
 
     unsorted = [u for u in embedded(amo_get("/api/v4/leads/unsorted?limit=200"), "unsorted")
                 if "avito" in (u.get("source_name") or "").lower()]
