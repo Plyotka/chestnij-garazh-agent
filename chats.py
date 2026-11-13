@@ -841,6 +841,22 @@ def followup_engine(tok):
         last_in = max((m.get("created") or 0) for m in ins) if ins else 0
         last_out = max((m.get("created") or 0) for m in outs) if outs else 0
         nowts = int(now.timestamp())
+        # F34 (кейс Радик 13.11): исходящее в чате, но БЕЗ заметки
+        # «Отправлено клиенту» — ручное сообщение менеджера из приложения
+        # Авито. Это касание человека: переносим антиспам-зазор на него —
+        # автодожим поверх живого диалога запрещён (перегруз клиента).
+        manual_outs = [m for m in outs if (m.get("created") or 0) > last_sent_ts]
+        if manual_outs:
+            mo = max(manual_outs, key=lambda m: m.get("created") or 0)
+            last_sent_ts = mo.get("created") or last_sent_ts
+            mt = (msg_text(mo) or "")[:60]
+            if mt and not any("(manual-авто)" in (((n.get("params") or {}).get("text") or ""))
+                              and mt[:25] in (((n.get("params") or {}).get("text") or ""))
+                              for n in notes):
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"(manual-авто): ручное сообщение менеджера в чате Авито «{mt}» "
+                            f"({datetime.fromtimestamp(mo.get('created') or 0, MSK).strftime('%d.%m %H:%M')}) — "
+                            f"зазор перенесён на него, автодожимы поверх не шлём."}}])
         # F27 (кейс Егор Пилипец 12.11): клиент сообщил, что УЖЕ приехал /
         # ждёт на месте → сделка в «Приехал», контрольные задачи закрываем.
         # Раньше таких слов не было ни в одной регулярке — сделка висела
@@ -1561,6 +1577,22 @@ def run():
                                   f"(запрос: {request or '—'}). Далее: назвать цену → "
                                   "уточнить время приезда → запросить телефон.",
                                   KONSTANTIN, tomorrow_10_msk())]
+                # F34b (кейс Радик 13.11): живой диалог с менеджером — его
+                # последняя реплика свежее 2 ч — шаблон не вставляем
+                # (перегруз клиента двумя касаниями сразу).
+                if tpl:
+                    try:
+                        _lo = max([(m.get("created") or 0)
+                                   for m in msgs if m.get("direction") == "out"] or [0])
+                        _li = max([(m.get("created") or 0)
+                                   for m in msgs if m.get("direction") == "in"] or [0])
+                        if _lo > _li and int(now.timestamp()) - _lo < 2 * 3600:
+                            tpl = None
+                            note += (f"\nШаблон НЕ отправлен: менеджер ведёт диалог "
+                                     f"(его реплика {(int(now.timestamp()) - _lo) // 60} мин назад) — "
+                                     "касание человека достаточно.")
+                    except Exception:
+                        pass
                 if tpl:
                     if eff_no_send:
                         pending = (cid, tpl)
