@@ -535,6 +535,30 @@ def ask_reviews(tok, now):
                     cid = m.group(1)
             if not cid:
                 continue
+            # F33-страховка (указание владельца 13.11): отзыв просим ТОЛЬКО у
+            # реально обслуженных. Статус 142 мог поставиться «вслепую», поэтому
+            # требуем след визита: либо в карточке (заметки/задачи про приезд,
+            # F27), либо в переписке («приехал/уже у вас/жду/на месте»).
+            hist = " ".join(note_text(n) for n in notes).lower()
+            evidence = bool(re.search(
+                r"приехал|уже (у вас|жду)|на месте|подъехал|стою у|"
+                r"переведена? в «приехал»|приехал\?", hist))
+            if not evidence:
+                try:
+                    msgs = http("GET", f"https://api.avito.ru/messenger/v3/accounts/"
+                                       f"{AVITO_UID}/chats/{cid}/messages/", token=tok).get("messages", [])
+                    in_txt = " ".join(msg_text(m) for m in msgs
+                                      if m.get("direction") == "in")
+                    evidence = bool(ARRIVED_RE.search(in_txt))
+                except Exception:
+                    evidence = False
+            if not evidence:
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": "Отзыв НЕ запрошен (F33-страховка): подтверждения визита в чате "
+                            "и карточке не найдено — сделка в 142, но клиент, возможно, не "
+                            "ремонтировался. Проверить перед ручной просьбой об отзыве."}}])
+                log(f"  отзыв: сделка {lid} — пропуск, нет подтверждения визита")
+                continue
             http("POST", f"https://api.avito.ru/messenger/v1/accounts/{AVITO_UID}"
                          f"/chats/{cid}/messages", token=tok,
                  body={"message": {"text": T_REVIEW}, "type": "text"})
