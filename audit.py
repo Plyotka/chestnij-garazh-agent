@@ -77,10 +77,15 @@ def main():
         idle_d = (nowts - (l.get("updated_at") or 0)) / 86400
         open_t = by_lead.get(lid, [])
         name = (l.get("name") or "")[:50]
-        if st in ST and not open_t and age_h > 3:
+        if st in (88470414, 88470418, 88470422) and not open_t and age_h > 3:
+            # «Приехал» (машина в работе) задач не требует
             issues.append(f"• {lid} «{name}» [{ST[st]}]: нет открытой задачи (создана {age_h:.0f} ч назад)")
         if st in (142, 143) and open_t:
             for t in open_t:
+                txt_t = (t.get("text") or "")
+                # задачи «поблагодарить/после закрытия» на закрытых — намеренные (F33/F35)
+                if "поблагодарить" in txt_t.lower() or "после закрытия" in txt_t.lower():
+                    continue
                 issues.append(f"• {lid} «{name}» [закрыта]: висит задача до "
                               f"{datetime.fromtimestamp(t.get('complete_till') or 0, MSK):%d.%m} — закрыть")
         if st == 88470422 and open_t:
