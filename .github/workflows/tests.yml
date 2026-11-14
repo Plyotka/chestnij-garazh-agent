@@ -1,0 +1,24 @@
+name: chg-tests
+
+on:
+  push:
+    paths:
+      - "chats.py"
+      - "razbor.py"
+      - "tests/**"
+  schedule:
+    # каждое утро 8:40 МСК (5:40 UTC) — регулярка не должна ломаться молча
+    - cron: "40 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Регрессионные тесты движка (кейсы F1–F38)
+        run: python3 -m unittest tests.test_engine -v

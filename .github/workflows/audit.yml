@@ -1,0 +1,22 @@
+name: chg-audit
+
+on:
+  schedule:
+    # ежедневно 19:40 МСК (16:40 UTC) — самоаудит перед вечерним переносом
+    - cron: "40 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
+      JOURNAL_LEAD_ID: "37575635"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Самоаудит воронки (детерминированный, без LLM)
+        run: python3 audit.py
