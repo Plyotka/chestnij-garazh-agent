@@ -107,6 +107,7 @@ CLOSE_RE = re.compile(
     r"не актуал|неактуал|уже не нужн|уже сделал|сделал в другом месте|"
     r"в другом месте|выбрал других|у других|передумал|не интересует|отказ|"
     r"не требуется|пока не нужн|не буду|отпад|отказал|хватит|отпишитесь|"
+    r"не надо|не, спасибо|не стоит|отстаньте|"
     r"нашол\b|наш(е|ё)л(а)? (уже )?(друг|решени|где|вариант|мастер|сервис|специалист)"
     r"|сам разобрался|решил(а)? сам|сам(а)? починил|уже решил",
     re.IGNORECASE)
@@ -855,6 +856,22 @@ def followup_engine(tok):
         outs = [m for m in msgs if m.get("direction") == "out"]
         if not outs:  # Бадри ещё не отвечал — агент молчит (жёсткое правило)
             continue
+        # F35 (кейс Денис 14.11): закрытые сделки (142/143) НИКОГДА не
+        # возвращаем в воронку по активности чата. Новое сообщение клиента
+        # после закрытия = заметка + задача человеку (ответ на отзыв/вопрос),
+        # статус не меняем.
+        if l.get("status_id") in (142, ST_CLOSED):
+            recent_in = [m for m in ins if (m.get("created") or 0) > (l.get("updated_at") or 0) - 2 * 86400]
+            if recent_in and not any("после закрытия" in (((n.get("params") or {}).get("text") or "")) for n in notes):
+                last_txt = msg_text(recent_in[0])[:100]
+                amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                    "text": f"F35: клиент написал ПОСЛЕ ЗАКРЫТИЯ сделки: «{last_txt}» — статус не меняем. "
+                            f"Если это ответ на просьбу об отзыве — поблагодарить; иначе разобрать вручную."}}])
+                add_task(lid, "Kimi для Бадри: клиент написал после закрытия сделки "
+                         f"({(l.get('name') or 'сделка')[:50]}): «{last_txt[:60]}» — ответить/поблагодарить, "
+                         "статус НЕ открывать", BADRI, nowts + 4 * 3600)
+                done["human"] += 1
+            continue
         # F18: телефон клиента из чата — детерминированно в контакт (не ждём LLM)
         ph = scan_phone(msgs)
         if ph and not any("Телефон из чата" in ((n.get("params") or {}).get("text") or "")
@@ -906,7 +923,7 @@ def followup_engine(tok):
         # ждёт на месте → сделка в «Приехал», контрольные задачи закрываем.
         # Раньше таких слов не было ни в одной регулярке — сделка висела
         # в «Приедет», пока человек не перевёл руками.
-        if l.get("status_id") != ST_PRIEHAL and ins:
+        if l.get("status_id") in (ST_FIRST, ST_TEPLY, ST_PRIEDET) and ins:
             arr_txt = " ".join(msg_text(m) for m in ins[:3])
             if ARRIVED_RE.search(arr_txt):
                 amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_PRIEHAL}])
@@ -1018,6 +1035,21 @@ def followup_engine(tok):
                 # недостижимо — 24 ч тишины после soft не наступали никогда)
                 if not any(ts > sam_due for ts in fup_ts):
                     send(lid, cid, T_SOFT, "soft")
+                else:
+                    # F36 (указание владельца 14.11 «да-да нет-нет закрываем»):
+                    # после напоминания клиент ответил вялым подтверждением
+                    # («да/да-да/хорошо/ок») и снова пропал ≥ суток — слов нет,
+                    # закрываем с прощанием.
+                    if (client_last_txt and last_in > sam_due
+                            and last_in < last_sent_ts
+                            and nowts - last_in >= 24 * 3600
+                            and len(client_last_txt) <= 25 and "?" not in client_last_txt
+                            and ACK_ANY_RE.match(client_last_txt.strip())):
+                        if send(lid, cid, T_BYE, "bye"):
+                            close_lead(lid, LOSS_PROPALA,
+                                       "После напоминания (сам наберёт) клиент ответил вялым "
+                                       "подтверждением и пропал на сутки — прощание и закрытие "
+                                       "«Пропала потребность» (правило владельца 14.11, F36).")
                 continue
             if last_in > last_out:  # клиент ждёт нашего ответа
                 if nowts - last_in < 2 * 3600:
@@ -1434,6 +1466,50 @@ def run():
             if not outs:
                 skipped.append({"uid": uid, "reason": "Бадри ещё не отвечал — агент молчит"})
                 log(f"  {cname}: Бадри ещё не отвечал — пропуск")
+                continue
+
+            # F38 (кейс Василий 14.11): клиент написал из ВТОРОГО чата — без
+            # этой проверки появится вторая сделка на того же человека.
+            # Ищем открытую чат-сделку клиента; нашли — новую принимаем и
+            # сразу закрываем «Дубль», а второй чат приклеиваем к основной.
+            dup_client = None
+            try:
+                import urllib.parse as _up
+                cands = embedded(amo_get(f"/api/v4/leads?query={_up.quote(cname)}&limit=10"), "leads")
+                for c in cands:
+                    if not c.get("id") or c.get("status_id") in (ST_CLOSED, 142):
+                        continue
+                    tags_c = [t.get("name") for t in (c.get("_embedded") or {}).get("tags", [])]
+                    if TAG_CHAT in tags_c and cname.lower() in (c.get("name") or "").lower():
+                        dup_client = c["id"]
+                        break
+            except Exception:
+                dup_client = None
+            if dup_client:
+                if DRY_RUN:
+                    log(f"  DRY_RUN {cname}: дубль клиента — открытая сделка {dup_client}")
+                    skipped.append({"uid": uid, "reason": f"дубль клиента, сделка {dup_client}"})
+                    continue
+                acc = amo("POST", f"/api/v4/leads/unsorted/{uid}/accept",
+                          {"user_id": BADRI, "status_id": ST_FIRST})
+                new_id = ((acc.get("_embedded") or {}).get("leads") or [{}])[0].get("id")
+                if new_id:
+                    amo("PATCH", "/api/v4/leads", [{"id": new_id, "status_id": ST_CLOSED,
+                                                    "loss_reason_id": LOSS_DUBL}])
+                    amo("POST", f"/api/v4/leads/{new_id}/notes", [{"note_type": "common", "params": {
+                        "text": f"Дубль клиента: {cname} писал из второго чата. Основная сделка "
+                                f"{dup_client}. Закрыто автоматически (F38)."}}])
+                    amo("POST", f"/api/v4/leads/{dup_client}/notes", [{"note_type": "common", "params": {
+                        "text": f"F38: клиент писал из ВТОРОГО чата ({cid}) — чат приклеён к этой сделке, "
+                                f"дубль закрыт. chat_id={cid}"}}])
+                    amo("POST", "/api/v4/tasks", [{
+                        "text": f"Kimi для Константина: клиент {cname} писал из второго чата — "
+                                f"проверить переписку ({cid[:16]}…), актуальный запрос во втором чате.",
+                        "responsible_user_id": KONSTANTIN,
+                        "complete_till": tomorrow_10_msk(),
+                        "entity_id": dup_client, "entity_type": "leads"}])
+                log(f"  {cname}: дубль клиента — сделка {dup_client}, новая заявка закрыта")
+                acted.append({"lead": new_id, "client": cname, "interest": None, "dup_of": dup_client})
                 continue
 
             # антидубль: тот же клиент (avito user id) уже обработан в этом прогоне

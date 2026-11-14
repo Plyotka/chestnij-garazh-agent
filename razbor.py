@@ -473,6 +473,29 @@ def process_unsorted(now):
                             else:
                                 due = today_18_msk()
                                 note_due = "клиент звонил снова — перезвонить сегодня"
+                            # F37 (кейс Sonata 14.11): считаем НЕУДАЧНЫЕ попытки
+                            # в заметках/результатах; 3+ — закрываем «Не
+                            # дозвонились», а не ставим бесконечный перезвон.
+                            try:
+                                dn = embedded(amo_get(f"/api/v4/leads/{dup}/notes?limit=100"), "notes")
+                                att = sum(1 for n in dn if re.search(
+                                    r"не бер|не дозвон", note_text(n).lower()))
+                                tr = embedded(amo_get(f"/api/v4/tasks?filter[entity_id]={dup}"
+                                          "&filter[entity_type][]=leads&limit=100"), "tasks")
+                                att += sum(1 for t in tr
+                                           if re.search(r"не бер|не дозвон",
+                                                        str(t.get("result") or "").lower()))
+                            except Exception:
+                                att = 0
+                            if att >= 3:
+                                amo("PATCH", "/api/v4/leads", [{"id": dup, "status_id": ST_CLOSED,
+                                                                "loss_reason_id": LOSS_NE_DOZVON}])
+                                amo("POST", f"/api/v4/leads/{dup}/notes", [{"note_type": "common", "params": {
+                                    "text": f"Закрыто автоматически (F37): {att} неудачных попыток дозвона, "
+                                            f"абонент не отвечает. Повторный звонок только по инициативе клиента."}}])
+                                close_my_tasks(dup)
+                                log(f"  лоток: {phone} — {att} попыток без ответа, сделка {dup} закрыта «Не дозвонились»")
+                                continue
                             upsert_task(dup, f"Kimi для Бадри: Перезвонить/актуализировать "
                                         f"по пропущенному: {phone} ({note_due}). "
                                         "Далее: не отвечает → перенос на следующий день, "
