@@ -978,7 +978,11 @@ def run():
             h, m = s.split(":")
             return int(h) * 60 + int(m)
         cur = now.hour * 60 + now.minute
-        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "20:00"))):
+        # окно до 21:00: ШАГ 0 (перенос просроченных) и лоток клиентам не
+        # пишут — чем длиннее окно, тем меньше шанс, что пропавший вечерний
+        # тик оставит просроченные задачи висеть до следующего дня (инцидент
+        # 13.11: прогонов не было 18:15–20:57, а 20:58 разбор уже молчал).
+        if not (_hm(os.environ.get("WINDOW_START", "9:00")) <= cur <= _hm(os.environ.get("WINDOW_END", "21:00"))):
             log("вне рабочего окна — выход без действий")
             print("SUMMARY_JSON:" + json.dumps(
                 {"run": now.strftime("%d.%m.%Y %H:%M"), "window_skip": True},

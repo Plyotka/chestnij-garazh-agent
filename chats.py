@@ -563,8 +563,8 @@ def ask_reviews(tok, now):
                          f"/chats/{cid}/messages", token=tok,
                  body={"message": {"text": T_REVIEW}, "type": "text"})
             amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
-                "text": f"Отзыв запрошен ({now.strftime('%d.%m.%Y')}, F33): отправлена просьба "
-                        f"оставить отзыв на Авито."}}])
+                "text": f"Отправлено клиенту (review): просьба оставить отзыв на Авито "
+                        f"({now.strftime('%d.%m.%Y')}, F33)."}}])
             sent_n += 1
             log(f"  отзыв: сделка {lid} «{(l.get('name') or '')[:40]}» — просьба отправлена")
         except Exception as e:
@@ -738,6 +738,27 @@ def followup_engine(tok):
 
     def add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
         _task_cache.pop(lead_id, None)  # кеш открытых задач протух
+        _raw_add_task(lead_id, text, till_ts, responsible)
+        # верификация (инцидент 14.11 «Перевозка умерших»: шаблон ушёл, а
+        # задача не создалась — amo отвалился на 401 между двумя запросами):
+        # перечитываем открытые; нет — повторяем; снова нет — флаг в карточку.
+        try:
+            ok = any(text[:40] in (t.get("text") or "") for t in open_tasks_by_id(lead_id))
+            if not ok:
+                time.sleep(8)
+                _task_cache.pop(lead_id, None)
+                _raw_add_task(lead_id, text, till_ts, responsible)
+                _task_cache.pop(lead_id, None)
+                ok = any(text[:40] in (t.get("text") or "") for t in open_tasks_by_id(lead_id))
+            if not ok:
+                amo("POST", f"/api/v4/leads/{lead_id}/notes", [{"note_type": "common", "params": {
+                    "text": "ВНИМАНИЕ: контрольная задача НЕ создана (API amo дважды не подтвердил): "
+                            f"«{text[:120]}». Создать вручную."}}])
+                log(f"  дожим+ {lead_id}: ЗАДАЧА НЕ СОЗДАНА (флаг в карточке)")
+        except Exception as e:
+            log(f"  дожим+ {lead_id}: верификация задачи не удалась ({e})")
+
+    def _raw_add_task(lead_id, text, till_ts, responsible=KONSTANTIN):
         # Правило владельца 06.11 (доуточнено 11.11): ОДНА открытая Kimi-задача
         # на сделку. Новая контрольная закрывает прежние — иначе копились пары
         # «Когда приедет?» + «за день до приезда подтвердить» (кейс 11.11:
