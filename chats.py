@@ -1505,6 +1505,17 @@ def run():
                     amo("POST", f"/api/v4/leads/{dup_client}/notes", [{"note_type": "common", "params": {
                         "text": f"F38: клиент писал из ВТОРОГО чата ({cid}) — чат приклеён к этой сделке, "
                                 f"дубль закрыт. chat_id={cid}"}}])
+                    # старые открытые задачи контура закрываем — одна сделка =
+                    # одна контрольная (инцидент 16.11: F38 давал вторую задачу)
+                    try:
+                        _ot = embedded(amo_get(f"/api/v4/tasks?filter[entity_id]={dup_client}"
+                                               "&filter[entity_type][]=leads&filter[is_completed]=0&limit=50"), "tasks")
+                        _mine = [t for t in _ot if (t.get("text") or "").startswith(("Kimi для", "Далее:"))]
+                        if _mine:
+                            amo("PATCH", "/api/v4/tasks",
+                                [{"id": t["id"], "is_completed": True} for t in _mine])
+                    except Exception:
+                        pass
                     amo("POST", "/api/v4/tasks", [{
                         "text": f"Kimi для Константина: клиент {cname} писал из второго чата — "
                                 f"проверить переписку ({cid[:16]}…), актуальный запрос во втором чате.",
