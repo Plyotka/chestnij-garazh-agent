@@ -1,0 +1,34 @@
+name: chg-watchdog
+
+on:
+  schedule:
+    # каждые ~15 минут в рабочем окне (сдвинутые слоты повышают шанс,
+    # что хоть один fire пройдёт, когда основные сетки GitHub пропускает)
+    - cron: "3,18,33,48 6-17 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Если прогонов не было >40 минут — дёрнуть razbor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LAST=$(gh run list --workflow razbor.yml --limit 1 --json createdAt --jq '.[0].createdAt' || echo "")
+          if [ -z "$LAST" ]; then gh workflow run razbor.yml; echo "no runs at all — dispatched"; exit 0; fi
+          NOW=$(date -u +%s)
+          LAST_TS=$(date -u -d "$LAST" +%s 2>/dev/null || date -u -jf "%Y-%m-%dT%H:%M:%SZ" "$LAST" +%s)
+          AGE=$(( (NOW - LAST_TS) / 60 ))
+          echo "last razbor run ${AGE} min ago ($LAST)"
+          if [ "$AGE" -gt 40 ]; then
+            gh workflow run razbor.yml
+            echo "stale — dispatched"
+          else
+            echo "fresh — nothing to do"
+          fi
