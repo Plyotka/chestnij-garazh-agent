@@ -3,14 +3,18 @@ name: chg-razbor
 on:
   schedule:
     # 09:00–19:30 МСК (UTC+3) каждые 30 минут
-    - cron: "*/30 6-16 * * *"
+    # 9:00-13:30 МСК каждые 30 мин (пик пропущенных, быстрый приём)
+    - cron: "*/30 6-12 * * *"
+    # 14:00-19:30 МСК раз в час (анализ: дневные тики редко что-то меняют,
+    # дожимы ушли в утреннюю пачку 8:00-9:30 — F31)
+    - cron: "27 11-16 * * *"
     # 19:57 МСК — последний вечерний прогон до дедлайна 20:00
     - cron: "57 16 * * *"
     # РЕЗЕРВНЫЕ сетки (инцидент 16.11: GitHub и автоматика одновременно
     # пропустили тики, контур молчал 10+ часов) — сдвинутые минуты повышают
     # шанс, что хотя бы одна сетка выстрелит в положенное окно
-    - cron: "8,38 6-16 * * *"
-    - cron: "22,52 6-16 * * *"
+    - cron: "8,38 6-12 * * *"
+    - cron: "3 11-16 * * *"
     - cron: "10 17 * * *"
   workflow_dispatch:
     inputs:
@@ -41,7 +45,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write  # avitolog шаг коммитит state.json
 
 jobs:
   razbor:
@@ -71,3 +75,14 @@ jobs:
         env:
           JOURNAL_LEAD_ID: "37575635"
         run: python3 journal.py
+      - name: Авито-монитор (баланс, истечения, активация, аномалии) — был отдельным chg-avitolog-monitor
+        if: always()
+        run: python3 avitolog/monitor.py | tee avitolog/monitor.out
+      - name: Сохранить состояние мониторинга
+        if: always()
+        run: |
+          git config user.email "agent@chg.local"
+          git config user.name "chg-agent"
+          git add avitolog/state.json
+          git diff --cached --quiet || git commit -m "avitolog: state $(date -u +%Y-%m-%dT%H:%M)"
+          git push
