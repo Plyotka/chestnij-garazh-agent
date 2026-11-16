@@ -104,6 +104,26 @@ class TestClientWasRe(unittest.TestCase):
         self.assertTrue(C.CLIENT_WAS_RE.search("делал у вас масло"))
 
 
+class TestSamNaberet16(unittest.TestCase):
+    def test_pozvonu_potom(self):      # Данил Шаров 16.11
+        self.assertTrue(C.SAM_NABERET_RE.search("Да я вам позвоню потом"))
+    def test_kak_soberus(self):        # Саша 16.11
+        self.assertTrue(C.SAM_NABERET_RE.search("Актуален, я как соберусь я позвоню"))
+
+
+class TestReviewDone(unittest.TestCase):
+    def test_ostavil_otzyv(self):      # Денис 16.11
+        import re
+        self.assertTrue(re.search(r"оставил(а)?\s+(уже\s+)?отзыв|отзыв\s+оставил",
+                                  "оставил отзыв", re.IGNORECASE))
+        self.assertTrue(re.search(r"оставил(а)?\s+(уже\s+)?отзыв|отзыв\s+оставил",
+                                  "Да, отзыв оставил", re.IGNORECASE))
+    def test_simple_thanks_not_review(self):
+        import re
+        self.assertFalse(re.search(r"оставил(а)?\s+(уже\s+)?отзыв|отзыв\s+оставил",
+                                   "спасибо, всё понял", re.IGNORECASE))
+
+
 class TestPhoneNorm(unittest.TestCase):
     def test_11_digits(self):
         self.assertEqual(C.norm_phone("89827745555"), "+79827745555")
