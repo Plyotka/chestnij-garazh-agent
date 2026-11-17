@@ -418,6 +418,29 @@ def process_unsorted(now):
                 phone = norm_phone(str(meta.get("from") or ""))
                 dup = find_open_lead_by_phone(phone)
                 if dup:
+                    # F41: если с этим номером УЖЕ был содержательный разговор
+                    # (звонок ≥30 сек за последние сутки) — перезвон НЕ нужен:
+                    # «перезвонить» поверх состоявшегося контакта = дубль
+                    # касания (кейс +79034892250 17.11: 6,5-мин разговор,
+                    # а движок ставил «перезвонить/актуализировать»).
+                    try:
+                        dn_notes = embedded(amo_get(f"/api/v4/leads/{dup}/notes?limit=250"), "notes")
+                        day_ago = now.timestamp() - 24 * 3600
+                        talked = any(n.get("note_type") in ("call_in", "call_out")
+                                       and ((n.get("params") or {}).get("duration") or 0) >= 30
+                                       and (n.get("created_at") or 0) >= day_ago
+                                       for n in dn_notes)
+                    except Exception:
+                        talked = False
+                    if talked:
+                        if not DRY_RUN:
+                            amo("POST", f"/api/v4/leads/{dup}/notes", [{"note_type": "common", "params": {
+                                "text": f"Повторный пропущенный {phone} ({now.strftime('%d.%m.%Y %H:%M')}) — "
+                                        f"разговор с номером уже состоялся за сутки (≥30 сек), задача "
+                                        f"перезвона НЕ поставлена (F41)."}}])
+                        log(f"  лоток: пропущенный {phone} — контакт уже был, перезвон не нужен (F41)")
+                        handled += 1
+                        continue
                     # повторный звонок с того же номера — дубль не плодим.
                     # Задача перезвона: только если свежий разбор НЕ говорит, что
                     # клиент пообещал перезвонить сам (кейс Патриот 11.11: клиент
