@@ -31,7 +31,7 @@ on:
 jobs:
   razbor:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
       MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
