@@ -111,6 +111,25 @@ class TestSamNaberet16(unittest.TestCase):
         self.assertTrue(C.SAM_NABERET_RE.search("Актуален, я как соберусь я позвоню"))
 
 
+class TestF41TalkedLogic(unittest.TestCase):
+    def test_talked_detection(self):
+        # логика F41: звонок >=30с за сутки = контакт состоялся
+        notes=[{"note_type":"call_out","params":{"duration":394},"created_at":1000},
+               {"note_type":"call_in","params":{"duration":5},"created_at":1000}]
+        now_ts=2000
+        talked=any(n["note_type"] in ("call_in","call_out")
+                   and (n.get("params") or {}).get("duration",0)>=30
+                   and n["created_at"]>=now_ts-86400 for n in notes)
+        self.assertTrue(talked)
+    def test_short_call_not_talked(self):
+        notes=[{"note_type":"call_in","params":{"duration":5},"created_at":1000}]
+        now_ts=2000
+        talked=any(n["note_type"] in ("call_in","call_out")
+                   and (n.get("params") or {}).get("duration",0)>=30
+                   and n["created_at"]>=now_ts-86400 for n in notes)
+        self.assertFalse(talked)
+
+
 class TestReviewDone(unittest.TestCase):
     def test_ostavil_otzyv(self):      # Денис 16.11
         import re
