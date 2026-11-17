@@ -26,6 +26,14 @@ jobs:
           LAST_TS=$(date -u -d "$LAST" +%s 2>/dev/null || date -u -jf "%Y-%m-%dT%H:%M:%SZ" "$LAST" +%s)
           AGE=$(( (NOW - LAST_TS) / 60 ))
           echo "last razbor run ${AGE} min ago ($LAST)"
+          # патология недели: раннер выдаётся, но job зависает без логов
+          # и блокирует concurrency-очередь навсегда. Режем зависшие
+          # (in_progress старше 35 мин) до отправки нового диспатча.
+          STUCK=$(gh run list --workflow razbor.yml --status in_progress --limit 5 --json databaseId,createdAt --jq '.[] | select((now - (.createdAt | fromdate)) > 2100) | .databaseId')
+          for R in $STUCK; do
+            echo "killing stuck run $R"
+            gh run cancel "$R" || true
+          done
           if [ "$AGE" -gt 40 ]; then
             gh workflow run razbor.yml
             echo "stale — dispatched"
