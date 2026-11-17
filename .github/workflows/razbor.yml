@@ -28,6 +28,9 @@ on:
         default: "20:00"
         type: string
 
+permissions:
+  contents: write  # шаг авитолога коммитит state.json (потерялось при правке on:, вернул)
+
 jobs:
   razbor:
     runs-on: ubuntu-latest
