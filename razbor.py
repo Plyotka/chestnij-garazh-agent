@@ -940,15 +940,21 @@ def process_closed_task_loops(now, skip_ids=None):
         low = result_txt.lower()
         if re.search(r"не наш профиль|не делаем|не занимаемся|не бер[её]м в работу|"
                      r"закрыть|не актуал|передумал|у других|сделал у других|"
-                     r"не дозвон|не берет|не берёт|не беру[тт]", low):
+                     r"не дозвон|не дозвонил|не отвечает|не отвечал|сбросил|занят|"
+                     r"не берет|не берёт|не беру[тт]", low):
             loss = (LOSS_NE_NASH_PROFIL
                     if re.search(r"профиль|не делаем|не занимаемся|не бер[её]м в работу", low)
                     else LOSS_DRUGIE if re.search(r"у других|другой сервис", low)
                     else LOSS_NE_DOZVON if re.search(r"не дозвон|не берет|не берёт|не беру[тт]", low)
                     else LOSS_PROPALA)
             if not DRY_RUN:
-                amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
-                                                "loss_reason_id": loss}])
+                for _attempt in range(3):
+                    amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
+                                                    "loss_reason_id": loss}])
+                    cur = http("GET", f"{AMO_BASE}/api/v4/leads/{lid}", token=AMO_TOKEN)
+                    if cur.get("status_id") == ST_CLOSED:
+                        break
+                    time.sleep(20)
                 amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
                     "text": f"Закрыто по результату задачи, закрытой человеком («{result_txt[:120]}») — "
                             f"детерминированное правило F22, без LLM. Ручное закрытие финально."}}])
