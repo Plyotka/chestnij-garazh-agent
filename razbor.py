@@ -49,6 +49,72 @@ PHONE_RE = re.compile(r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*[\s\-]?\d{3}[\s\-]?\d{2}[\
 ST_CLOSED = 143            # Закрыто не реализовано
 LOSS_NE_NASH_PROFIL = 24763846
 LOSS_NE_DOZVON = 24853446  # Не дозвонились
+# F46: терминальные результаты задач, закрытых человеком («не актуально»,
+# «не дозвонился» и т.п.) — такая сделка закрывается навсегда, без LLM и
+# без новых задач. Используется в F22 и в страховочной сети rescue_terminal_closed.
+RESULT_CLOSE_RE = re.compile(
+    r"не наш профиль|не делаем|не занимаемся|не бер[её]м в работу|"
+    r"закрыть|не актуал|передумал|у других|сделал у других|"
+    r"не дозвон|не дозвонил|не отвечает|не отвечал|сбросил|занят|"
+    r"не берет|не берёт|не беру[тт]", re.IGNORECASE)
+
+
+def result_text_of(task):
+    res = task.get("result")
+    try:
+        if isinstance(res, list) and res:
+            return str(res[0].get("text") or "")
+        if isinstance(res, dict):
+            return str(res.get("text") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def rescue_terminal_closed(now):
+    """F46: Бадри/Константин закрыли задачу терминальным результатом
+    («не актуально», «не дозвонился»...), а сделка всё ещё открыта — F22
+    промахнулся или PATCH закрытия съеден сбоем. Закрываем с верификацией.
+    Любая давность: не зависит от 24-часового окна LLM-цикла."""
+    from_ts = int((now - timedelta(days=4)).timestamp())
+    resp = amo_get(f"/api/v4/leads?filter[pipeline_id][]=11282498"
+                   f"&filter[updated_at][from]={from_ts}&limit=200")
+    rescued = 0
+    for l in embedded(resp, "leads"):
+        if l.get("status_id") in (ST_SUCCESS, ST_CLOSED):
+            continue
+        lid = l["id"]
+        try:
+            ts = embedded(amo_get(f"/api/v4/tasks?filter[entity_id]={lid}"
+                                  "&filter[entity_type][]=leads&limit=100"), "tasks")
+        except Exception:
+            continue
+        mine_closed = [t for t in ts
+                       if t.get("is_completed")
+                       and t.get("updated_by") in (BADRI, KONSTANTIN)]
+        terminal = [t for t in mine_closed
+                    if RESULT_CLOSE_RE.search(result_text_of(t).lower())]
+        if not terminal:
+            continue
+        last = max(terminal, key=lambda t: t.get("updated_at") or 0)
+        res_txt = result_text_of(last)
+        try:
+            for _attempt in range(3):
+                amo("PATCH", "/api/v4/leads", [{"id": lid, "status_id": ST_CLOSED,
+                                                "loss_reason_id": LOSS_PROPALA}])
+                cur = http("GET", f"{AMO_BASE}/api/v4/leads/{lid}", token=AMO_TOKEN)
+                if cur.get("status_id") == ST_CLOSED:
+                    break
+                time.sleep(20)
+            amo("POST", f"/api/v4/leads/{lid}/notes", [{"note_type": "common", "params": {
+                "text": f"F46: задача закрыта человеком с терминальным результатом («{res_txt[:100]}»), "
+                        f"но сделка осталась открытой — закрыта страховочной сетью, без новых задач."}}])
+            close_my_tasks(lid)
+            rescued += 1
+            log(f"  F46 {lid}: закрыта (результат «{res_txt[:40]}»)")
+        except Exception as e:
+            log(f"  F46 {lid}: ошибка ({e})")
+    return rescued
 LOSS_DUBL = 24765102       # Дубль
 LOSS_PROPALA = 24393498    # Пропала потребность
 LOSS_DRUGIE = 24393506     # Выбрали других
@@ -938,10 +1004,7 @@ def process_closed_task_loops(now, skip_ids=None):
         # возвращать задачи не надо. LLM-цикл (decide_next_step) — только для
         # живых исходов («перезвонил», «приедет», «думает»).
         low = result_txt.lower()
-        if re.search(r"не наш профиль|не делаем|не занимаемся|не бер[её]м в работу|"
-                     r"закрыть|не актуал|передумал|у других|сделал у других|"
-                     r"не дозвон|не дозвонил|не отвечает|не отвечал|сбросил|занят|"
-                     r"не берет|не берёт|не беру[тт]", low):
+        if RESULT_CLOSE_RE.search(low):
             loss = (LOSS_NE_NASH_PROFIL
                     if re.search(r"профиль|не делаем|не занимаемся|не бер[её]м в работу", low)
                     else LOSS_DRUGIE if re.search(r"у других|другой сервис", low)
@@ -1205,6 +1268,11 @@ def run():
     # разбор обновил ещё открытую старую задачу, Бадри её закрыл — и больше
     # ничто не ставило следующий шаг.
     closed_loop = process_closed_task_loops(now, skip_ids={p.get("lead_id") for p in processed})
+    # F46: страховочная сеть «Бадри закрыл — а задача вернулась»: все открытые
+    # сделки с терминально закрытой человеком задачей закрываются с верификацией.
+    rescued = rescue_terminal_closed(now)
+    if rescued:
+        log(f"F46: спасено {rescued} сделок с терминальным результатом")
 
     summary = {
         "run": now.strftime("%d.%m.%Y %H:%M"),

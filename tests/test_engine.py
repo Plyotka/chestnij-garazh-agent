@@ -143,6 +143,19 @@ class TestReviewDone(unittest.TestCase):
                                    "спасибо, всё понял", re.IGNORECASE))
 
 
+class TestResultCloseRe(unittest.TestCase):
+    def test_terminal_results(self):
+        cases = ["не актуально", "Не дозвонился", "не отвечает", "сбросил звонок",
+                 "уже сделал у других", "передумал", "не наш профиль", "закрыть"]
+        for c in cases:
+            self.assertTrue(R.RESULT_CLOSE_RE.search(c.lower()), c)
+    def test_live_results_not_terminal(self):
+        cases = ["перезвонил, договорились о завтра", "приехал", "думает",
+                 "согласовал визит на субботу"]
+        for c in cases:
+            self.assertFalse(R.RESULT_CLOSE_RE.search(c.lower()), c)
+
+
 class TestPhoneNorm(unittest.TestCase):
     def test_11_digits(self):
         self.assertEqual(C.norm_phone("89827745555"), "+79827745555")
