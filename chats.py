@@ -1040,6 +1040,16 @@ def followup_engine(tok):
             if (last_key and any(k in last_key for k in BYE_KEYS)
                     and last_in < last_sent_ts
                     and nowts - last_sent_ts >= 24 * 3600):
+                # F44: если «bye» уже уходил, а сделка всё ещё открыта —
+                # закрытие в своё время съел сбой API (кейсы Алексей/Игорь/
+                # klimovv 24.11: прощание доставлено, PATCH закрытия нет,
+                # клиенту грозило ВТОРОЕ прощание). Закрываем без отправки.
+                if any(k in last_key for k in ("bye",)):
+                    close_lead(lid, LOSS_PROPALA,
+                               "Прощание было отправлено ранее, закрытие не доехало из-за сбоя "
+                               "API — закрыто автоматически без повторной отправки (F44).")
+                    done["closed"] += 1
+                    continue
                 if send(lid, cid, T_BYE, "bye"):
                     close_lead(lid, LOSS_PROPALA,
                                "Дожим не получил ответа более суток — отправлено "
