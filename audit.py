@@ -103,6 +103,30 @@ def main():
             issues.append(f"• задача {t['id']} просрочена {(nowts - due) / 86400:.1f} сут: "
                           f"{(t.get('text') or '')[:60]}")
 
+    # F46-контроль: человек закрыл задачу терминальным результатом, а сделка
+    # открыта (страховая сеть razbor должна была закрыть — если висит, API болеет)
+    import re as _re
+    TERMINAL = _re.compile(r"не актуал|не дозвон|не отвечает|сбросил|передумал|у других|"
+                           r"не наш профиль|закрыть|не делаем", _re.IGNORECASE)
+    all_tasks = get_all("/api/v4/tasks?limit=250")
+    closed_by_human = [t for t in all_tasks
+                       if t.get("is_completed") and t.get("updated_by") in (14367338, 14221122)]
+    for t in closed_by_human:
+        res = t.get("result")
+        txt = ""
+        try:
+            if isinstance(res, list) and res:
+                txt = str(res[0].get("text") or "")
+            elif isinstance(res, dict):
+                txt = str(res.get("text") or "")
+        except Exception:
+            pass
+        eid = t.get("entity_id")
+        if txt and eid in {l["id"] for l in leads} and TERMINAL.search(txt):
+            nm = next((l.get("name") or "") for l in leads if l["id"] == eid)
+            issues.append(f"• {eid} «{nm[:40]}»: терминальный результат («{txt[:40]}»), "
+                          f"но сделка открыта — закрыть")
+
     header = f"[АУДИТ] {now.strftime('%d.%m.%Y')} — "
     if not issues:
         text = header + "аномалий нет, воронка чиста"
