@@ -1520,9 +1520,32 @@ def run():
                     amo("POST", f"/api/v4/leads/{new_id}/notes", [{"note_type": "common", "params": {
                         "text": f"Дубль клиента: {cname} писал из второго чата. Основная сделка "
                                 f"{dup_client}. Закрыто автоматически (F38)."}}])
-                    amo("POST", f"/api/v4/leads/{dup_client}/notes", [{"note_type": "common", "params": {
-                        "text": f"F38: клиент писал из ВТОРОГО чата ({cid}) — чат приклеён к этой сделке, "
-                                f"дубль закрыт. chat_id={cid}"}}])
+                    # F43 (кейс Антон 24.11): НЕ перезаписываем chat_id, если он УЖЕ
+                    # есть — сделка обслуживания суппортов получила чужой чат (ГРМ
+                    # Coolray), дожим читал чужую переписку и отправил клиенту ложное
+                    # «не актуален». Второй чат — только заметка + задача человеку.
+                    has_chat = False
+                    try:
+                        _dn = embedded(amo_get(f"/api/v4/leads/{dup_client}/notes?limit=100"), "notes")
+                        has_chat = any("chat_id=" in (((n.get("params") or {}).get("text") or ""))
+                                       for n in _dn)
+                    except Exception:
+                        has_chat = False
+                    if has_chat:
+                        amo("POST", f"/api/v4/leads/{dup_client}/notes", [{"note_type": "common", "params": {
+                            "text": f"F38/F43: клиент {cname} писал из ЕЩЁ одного чата ({cid[:20]}…) — "
+                                    f"сделка уже привязана к другому чату, НЕ переписываем. Проверить "
+                                    f"второй чат вручную: может, другая услуга (тогда нужна отдельная сделка)."}}])
+                        amo("POST", "/api/v4/tasks", [{
+                            "text": f"Kimi для Константина: клиент {cname} писал из второго чата "
+                                    f"({cid[:20]}…) — проверить вручную: другая услуга или тот же запрос.",
+                            "responsible_user_id": KONSTANTIN,
+                            "complete_till": tomorrow_10_msk(),
+                            "entity_id": dup_client, "entity_type": "leads"}])
+                    else:
+                        amo("POST", f"/api/v4/leads/{dup_client}/notes", [{"note_type": "common", "params": {
+                            "text": f"F38: клиент писал из ВТОРОГО чата ({cid}) — чат приклеён к этой сделке, "
+                                    f"дубль закрыт. chat_id={cid}"}}])
                     # старые открытые задачи контура закрываем — одна сделка =
                     # одна контрольная (инцидент 16.11: F38 давал вторую задачу)
                     try:
